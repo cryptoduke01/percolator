@@ -1983,21 +1983,25 @@ impl RiskEngine {
         Ok(due)
     }
 
-    /// Touch account for force-realize paths: settles funding and fees but
+    /// Touch account for force-realize paths: settles funding, mark, and fees but
     /// uses best-effort fee settle that can't stall on margin checks.
-    fn touch_account_for_force_realize(&mut self, idx: u16, now_slot: u64) -> Result<()> {
+    fn touch_account_for_force_realize(&mut self, idx: u16, now_slot: u64, oracle_price: u64) -> Result<()> {
         // Funding settle is required for correct pnl
         self.touch_account(idx)?;
+        // Mark-to-market settlement (variation margin)
+        self.settle_mark_to_oracle(idx, oracle_price)?;
         // Best-effort fees; never fails due to maintenance margin
         let _ = self.settle_maintenance_fee_best_effort_for_crank(idx, now_slot)?;
         Ok(())
     }
 
-    /// Touch account for liquidation paths: settles funding and fees but
+    /// Touch account for liquidation paths: settles funding, mark, and fees but
     /// uses best-effort fee settle since we're about to liquidate anyway.
-    fn touch_account_for_liquidation(&mut self, idx: u16, now_slot: u64) -> Result<()> {
+    fn touch_account_for_liquidation(&mut self, idx: u16, now_slot: u64, oracle_price: u64) -> Result<()> {
         // Funding settle is required for correct pnl
         self.touch_account(idx)?;
+        // Mark-to-market settlement (variation margin)
+        self.settle_mark_to_oracle(idx, oracle_price)?;
         // Best-effort fees; margin check would just block the liquidation we need to do
         let _ = self.settle_maintenance_fee_best_effort_for_crank(idx, now_slot)?;
         Ok(())
@@ -2406,7 +2410,7 @@ impl RiskEngine {
                     self.enter_risk_reduction_only_mode();
 
                     if !self.accounts[idx].position_size.is_zero() {
-                        if self.touch_account_for_force_realize(idx as u16, now_slot).is_err() {
+                        if self.touch_account_for_force_realize(idx as u16, now_slot, oracle_price).is_err() {
                             force_realize_errors += 1;
                             self.risk_reduction_only = true;
                         } else {
@@ -3172,8 +3176,8 @@ impl RiskEngine {
             return Ok(false);
         }
 
-        // Settle funding + best-effort fees (can't block on margin - we're liquidating)
-        self.touch_account_for_liquidation(idx, now_slot)?;
+        // Settle funding + mark-to-market + best-effort fees (can't block on margin - we're liquidating)
+        self.touch_account_for_liquidation(idx, now_slot, oracle_price)?;
 
         let account = &self.accounts[idx as usize];
         // MTM eligibility: account is liquidatable if MTM equity < maintenance margin
@@ -3282,8 +3286,8 @@ impl RiskEngine {
             return Ok((false, DeferredAdl::ZERO));
         }
 
-        // Settle funding + best-effort fees (can't block on margin - we're liquidating)
-        self.touch_account_for_liquidation(idx, now_slot)?;
+        // Settle funding + mark-to-market + best-effort fees (can't block on margin - we're liquidating)
+        self.touch_account_for_liquidation(idx, now_slot, oracle_price)?;
 
         let account = &self.accounts[idx as usize];
         // MTM eligibility: account is liquidatable if MTM equity < maintenance margin
@@ -3534,7 +3538,7 @@ impl RiskEngine {
 
             // Best-effort touch: can't stall on margin checks
             if self
-                .touch_account_for_force_realize(idx as u16, now_slot)
+                .touch_account_for_force_realize(idx as u16, now_slot, oracle_price)
                 .is_err()
             {
                 errors += 1;
@@ -3896,7 +3900,44 @@ impl RiskEngine {
         Self::settle_account_funding(account, self.funding_index_qpb_e6)
     }
 
-    /// Full account touch: funding + maintenance fees + warmup settlement.
+    /// Settle mark-to-market PnL to the current oracle price (variation margin).
+    ///
+    /// This realizes all unrealized PnL at the given oracle price and resets
+    /// entry_price = oracle_price. After calling this, mark_pnl_for_position
+    /// will return 0 for this account at this oracle price.
+    ///
+    /// This makes positions fungible: any LP can close any user's position
+    /// because PnL is settled to a common reference price.
+    pub fn settle_mark_to_oracle(&mut self, idx: u16, oracle_price: u64) -> Result<()> {
+        if idx as usize >= MAX_ACCOUNTS || !self.is_used(idx as usize) {
+            return Err(RiskError::AccountNotFound);
+        }
+
+        let account = &mut self.accounts[idx as usize];
+
+        if account.position_size.is_zero() {
+            // No position: just set entry to oracle for determinism
+            account.entry_price = oracle_price;
+            return Ok(());
+        }
+
+        // Compute mark PnL at current oracle
+        let mark = Self::mark_pnl_for_position(
+            account.position_size.get(),
+            account.entry_price,
+            oracle_price,
+        )?;
+
+        // Realize the mark PnL
+        account.pnl = account.pnl.saturating_add(mark);
+
+        // Reset entry to oracle (mark PnL is now 0 at this price)
+        account.entry_price = oracle_price;
+
+        Ok(())
+    }
+
+    /// Full account touch: funding + mark settlement + maintenance fees + warmup.
     /// This is the standard "lazy settlement" path called on every user operation.
     /// Triggers liquidation check if fees push account below maintenance margin.
     pub fn touch_account_full(
@@ -3908,10 +3949,13 @@ impl RiskEngine {
         // 1. Settle funding
         self.touch_account(idx)?;
 
-        // 2. Settle maintenance fees (may trigger undercollateralized error)
+        // 2. Settle mark-to-market (variation margin)
+        self.settle_mark_to_oracle(idx, oracle_price)?;
+
+        // 3. Settle maintenance fees (may trigger undercollateralized error)
         self.settle_maintenance_fee(idx, now_slot, oracle_price)?;
 
-        // 3. Settle warmup (convert warmed PnL to capital, realize losses)
+        // 4. Settle warmup (convert warmed PnL to capital, realize losses)
         self.settle_warmup_to_capital(idx)?;
 
         Ok(())
@@ -4321,10 +4365,13 @@ impl RiskEngine {
             size,
         )?;
 
-        // Settle funding and maintenance fees for both accounts (propagate errors)
+        // Settle funding, mark-to-market, and maintenance fees for both accounts
+        // Mark settlement MUST happen before position changes (variation margin)
         // Note: warmup is settled at the END after trade PnL is generated
         self.touch_account(user_idx)?;
         self.touch_account(lp_idx)?;
+        self.settle_mark_to_oracle(user_idx, oracle_price)?;
+        self.settle_mark_to_oracle(lp_idx, oracle_price)?;
         self.settle_maintenance_fee(user_idx, now_slot, oracle_price)?;
         self.settle_maintenance_fee(lp_idx, now_slot, oracle_price)?;
 
@@ -4354,34 +4401,6 @@ impl RiskEngine {
             (&mut right[0], &mut left[lp_idx as usize])
         };
 
-        // Calculate PNL impact from closing existing position
-        let mut user_pnl_delta = 0i128;
-        let mut lp_pnl_delta = 0i128;
-
-        if !user.position_size.is_zero() {
-            let old_position = user.position_size.get();
-            let old_entry = user.entry_price;
-
-            if (old_position > 0 && exec_size < 0) || (old_position < 0 && exec_size > 0) {
-                let close_size = core::cmp::min(
-                    saturating_abs_i128(old_position),
-                    saturating_abs_i128(exec_size),
-                );
-                let price_diff = if old_position > 0 {
-                    (exec_price as i128).saturating_sub(old_entry as i128)
-                } else {
-                    (old_entry as i128).saturating_sub(exec_price as i128)
-                };
-
-                // Use saturating arithmetic (no overflow errors needed with Solana atomicity)
-                let pnl = price_diff
-                    .saturating_mul(close_size)
-                    .saturating_div(1_000_000);
-                user_pnl_delta = pnl;
-                lp_pnl_delta = -pnl;
-            }
-        }
-
         // Calculate new positions
         let new_user_position = user.position_size.get().saturating_add(exec_size);
         let new_lp_position = lp.position_size.get().saturating_sub(exec_size);
@@ -4393,105 +4412,53 @@ impl RiskEngine {
             return Err(RiskError::Overflow);
         }
 
-        // Calculate new entry prices
-        let mut new_user_entry = user.entry_price;
-        let mut new_lp_entry = lp.entry_price;
-
-        // Update user entry price
-        let user_pos = user.position_size.get();
-        if (user_pos > 0 && exec_size > 0) || (user_pos < 0 && exec_size < 0) {
-            let old_notional = mul_u128(
-                saturating_abs_i128(user_pos) as u128,
-                user.entry_price as u128,
-            );
-            let new_notional = mul_u128(saturating_abs_i128(exec_size) as u128, exec_price as u128);
-            let total_notional = add_u128(old_notional, new_notional);
-            let total_size = saturating_abs_i128(user_pos)
-                .saturating_add(saturating_abs_i128(exec_size));
-            if total_size != 0 {
-                new_user_entry = div_u128(total_notional, total_size as u128)? as u64;
-            }
-        } else if saturating_abs_i128(user_pos) < saturating_abs_i128(exec_size) {
-            new_user_entry = exec_price;
-        }
-
-        // Update LP entry price
-        // Bug #8 fix: Always update entry on sign flip, regardless of abs comparison
-        let lp_pos = lp.position_size.get();
-        let lp_sign_flip = (lp_pos > 0 && new_lp_position < 0)
-            || (lp_pos < 0 && new_lp_position > 0);
-
-        if lp_pos == 0 {
-            new_lp_entry = exec_price;
-        } else if lp_sign_flip && new_lp_position != 0 {
-            // Bug #8 fix: On any sign flip with nonzero new position, use exec_price
-            new_lp_entry = exec_price;
-        } else if (lp_pos > 0 && new_lp_position > lp_pos)
-            || (lp_pos < 0 && new_lp_position < lp_pos)
-        {
-            // Position expanding in same direction: weighted average entry
-            let old_notional = mul_u128(
-                saturating_abs_i128(lp_pos) as u128,
-                lp.entry_price as u128,
-            );
-            let new_notional = mul_u128(saturating_abs_i128(exec_size) as u128, exec_price as u128);
-            let total_notional = add_u128(old_notional, new_notional);
-            let total_size = saturating_abs_i128(lp_pos)
-                .saturating_add(saturating_abs_i128(exec_size));
-            if total_size != 0 {
-                new_lp_entry = div_u128(total_notional, total_size as u128)? as u64;
-            }
-        }
+        // Trade PnL = (oracle - exec_price) * exec_size (zero-sum between parties)
+        // User gains if buying below oracle (exec_size > 0, oracle > exec_price)
+        // LP gets opposite sign
+        // Note: entry_price is already oracle_price after settle_mark_to_oracle
+        let price_diff = (oracle_price as i128).saturating_sub(exec_price as i128);
+        let trade_pnl = price_diff
+            .saturating_mul(exec_size)
+            .saturating_div(1_000_000);
 
         // Compute final PNL values
-        let new_user_pnl = user
-            .pnl.get()
-            .saturating_add(user_pnl_delta)
+        let new_user_pnl = user.pnl.get()
+            .saturating_add(trade_pnl)
             .saturating_sub(fee as i128);
-        let new_lp_pnl = lp.pnl.get().saturating_add(lp_pnl_delta);
+        let new_lp_pnl = lp.pnl.get().saturating_sub(trade_pnl);
 
-        // Check user maintenance margin (MTM: includes unrealized mark PnL)
-        // FAIL-SAFE: overflow in mark_pnl => equity=0 => Undercollateralized (not generic Overflow)
+        // Check user maintenance margin
+        // After settle_mark_to_oracle, entry_price = oracle_price, so mark_pnl = 0
+        // Equity = capital + realized_pnl (trade_pnl is already in new_user_pnl)
         if new_user_position != 0 {
-            // MTM equity = capital + new_realized_pnl + mark_pnl(new_pos, new_entry, oracle)
-            let user_equity_mtm = match Self::mark_pnl_for_position(new_user_position, new_user_entry, oracle_price) {
-                Ok(user_mark) => {
-                    let user_cap_i = u128_to_i128_clamped(user.capital.get());
-                    let user_eq_i = user_cap_i.saturating_add(new_user_pnl).saturating_add(user_mark);
-                    if user_eq_i > 0 { user_eq_i as u128 } else { 0 }
-                }
-                Err(_) => 0, // Overflow => worst-case equity => will fail margin check
-            };
+            let user_cap_i = u128_to_i128_clamped(user.capital.get());
+            let user_eq_i = user_cap_i.saturating_add(new_user_pnl);
+            let user_equity = if user_eq_i > 0 { user_eq_i as u128 } else { 0 };
             let position_value = mul_u128(
                 saturating_abs_i128(new_user_position) as u128,
                 oracle_price as u128,
             ) / 1_000_000;
             let margin_required =
                 mul_u128(position_value, self.params.maintenance_margin_bps as u128) / 10_000;
-            if user_equity_mtm <= margin_required {
+            if user_equity <= margin_required {
                 return Err(RiskError::Undercollateralized);
             }
         }
 
-        // Check LP maintenance margin (MTM: includes unrealized mark PnL)
-        // FAIL-SAFE: overflow in mark_pnl => equity=0 => Undercollateralized (not generic Overflow)
+        // Check LP maintenance margin
+        // After settle_mark_to_oracle, entry_price = oracle_price, so mark_pnl = 0
+        // Equity = capital + realized_pnl (trade_pnl is already in new_lp_pnl)
         if new_lp_position != 0 {
-            // MTM equity = capital + new_realized_pnl + mark_pnl(new_pos, new_entry, oracle)
-            let lp_equity_mtm = match Self::mark_pnl_for_position(new_lp_position, new_lp_entry, oracle_price) {
-                Ok(lp_mark) => {
-                    let lp_cap_i = u128_to_i128_clamped(lp.capital.get());
-                    let lp_eq_i = lp_cap_i.saturating_add(new_lp_pnl).saturating_add(lp_mark);
-                    if lp_eq_i > 0 { lp_eq_i as u128 } else { 0 }
-                }
-                Err(_) => 0, // Overflow => worst-case equity => will fail margin check
-            };
+            let lp_cap_i = u128_to_i128_clamped(lp.capital.get());
+            let lp_eq_i = lp_cap_i.saturating_add(new_lp_pnl);
+            let lp_equity = if lp_eq_i > 0 { lp_eq_i as u128 } else { 0 };
             let position_value = mul_u128(
                 saturating_abs_i128(new_lp_position) as u128,
                 oracle_price as u128,
             ) / 1_000_000;
             let margin_required =
                 mul_u128(position_value, self.params.maintenance_margin_bps as u128) / 10_000;
-            if lp_equity_mtm <= margin_required {
+            if lp_equity <= margin_required {
                 return Err(RiskError::Undercollateralized);
             }
         }
@@ -4505,11 +4472,11 @@ impl RiskEngine {
 
         user.pnl = I128::new(new_user_pnl);
         user.position_size = I128::new(new_user_position);
-        user.entry_price = new_user_entry;
+        user.entry_price = oracle_price;
 
         lp.pnl = I128::new(new_lp_pnl);
         lp.position_size = I128::new(new_lp_position);
-        lp.entry_price = new_lp_entry;
+        lp.entry_price = oracle_price;
 
         // Update total open interest tracking (O(1))
         // OI = sum of abs(position_size) across all accounts
@@ -5550,9 +5517,10 @@ impl RiskEngine {
     /// `(actual - expected) <= MAX_ROUNDING_SLACK` (bounded dust). Funding payments
     /// are rounded UP when accounts pay, ensuring the vault never has less than
     /// what's owed. The bounded dust check catches accidental minting bugs.
-    pub fn check_conservation(&self) -> bool {
+    pub fn check_conservation(&self, oracle_price: u64) -> bool {
         let mut total_capital = 0u128;
         let mut net_pnl: i128 = 0;
+        let mut net_mark: i128 = 0;
         let global_index = self.funding_index_qpb_e6;
 
         self.for_each_used(|_idx, account| {
@@ -5574,25 +5542,37 @@ impl RiskEngine {
                     };
                     settled_pnl = settled_pnl.saturating_sub(payment);
                 }
+
+                // Compute unsettled mark PnL (variation margin not yet settled)
+                if let Ok(mark) = Self::mark_pnl_for_position(
+                    account.position_size.get(),
+                    account.entry_price,
+                    oracle_price,
+                ) {
+                    net_mark = net_mark.saturating_add(mark);
+                }
+                // If mark calculation overflows, skip it (conservative: assume zero)
             }
             net_pnl = net_pnl.saturating_add(settled_pnl);
         });
 
         // Conservation formula:
-        // vault + loss_accum >= sum(capital) + sum(settled_pnl) + insurance
+        // vault + loss_accum >= sum(capital) + sum(settled_pnl) + sum(mark_pnl) + insurance
         //
         // Where:
         // - loss_accum: value that "left" the system (unrecoverable losses)
         // - settled_pnl: pnl after accounting for unsettled funding
+        // - mark_pnl: unrealized mark-to-market PnL (should be ~zero-sum, but include for precision)
         //
         // Funding payments are rounded UP when accounts pay, so the vault always has
         // at least what's owed. The slack (dust) is bounded by MAX_ROUNDING_SLACK.
+        let total_pnl = net_pnl.saturating_add(net_mark);
         let base = add_u128(total_capital, self.insurance_fund.balance.get());
 
-        let expected = if net_pnl >= 0 {
-            add_u128(base, net_pnl as u128)
+        let expected = if total_pnl >= 0 {
+            add_u128(base, total_pnl as u128)
         } else {
-            base.saturating_sub(neg_i128_to_u128(net_pnl))
+            base.saturating_sub(neg_i128_to_u128(total_pnl))
         };
 
         let actual = add_u128(self.vault.get(), self.loss_accum.get());

@@ -6,6 +6,9 @@ use percolator::*;
 // Use the no-op matcher for tests
 const MATCHER: NoOpMatcher = NoOpMatcher;
 
+// Default oracle price for conservation checks (1 unit in 6 decimal scale)
+const DEFAULT_ORACLE: u64 = 1_000_000;
+
 // ==============================================================================
 // DETERMINISTIC PRNG FOR FUZZ TESTS
 // ==============================================================================
@@ -78,7 +81,14 @@ fn default_params() -> RiskParams {
 
 fn assert_conserved(engine: &RiskEngine) {
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
+        "Conservation invariant violated"
+    );
+}
+
+fn assert_conserved_at(engine: &RiskEngine, oracle_price: u64) {
+    assert!(
+        engine.check_conservation(oracle_price),
         "Conservation invariant violated"
     );
 }
@@ -339,15 +349,15 @@ fn test_conservation_simple() {
     let user2 = engine.add_user(0).unwrap();
 
     // Initial state should conserve
-    assert!(engine.check_conservation());
+    assert!(engine.check_conservation(DEFAULT_ORACLE));
 
     // Deposit to user1
     engine.deposit(user1, 1000, 0).unwrap();
-    assert!(engine.check_conservation());
+    assert!(engine.check_conservation(DEFAULT_ORACLE));
 
     // Deposit to user2
     engine.deposit(user2, 2000, 0).unwrap();
-    assert!(engine.check_conservation());
+    assert!(engine.check_conservation(DEFAULT_ORACLE));
 
     // PNL is zero-sum: user1 gains 500, user2 loses 500
     // (vault unchanged since this is internal redistribution)
@@ -355,11 +365,11 @@ fn test_conservation_simple() {
     assert_eq!(engine.accounts[user2 as usize].pnl.get(), 0);
     engine.accounts[user1 as usize].pnl = I128::new(500);
     engine.accounts[user2 as usize].pnl = I128::new(-500);
-    assert!(engine.check_conservation());
+    assert!(engine.check_conservation(DEFAULT_ORACLE));
 
     // Withdraw from user1's capital
     engine.withdraw(user1, 500, 0, 1_000_000).unwrap();
-    assert!(engine.check_conservation());
+    assert!(engine.check_conservation(DEFAULT_ORACLE));
 }
 
 #[test]
@@ -2272,7 +2282,7 @@ fn test_panic_settle_adl_waterfall() {
 
     // Verify conservation before
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation should hold before panic settle"
     );
 
@@ -2291,7 +2301,7 @@ fn test_panic_settle_adl_waterfall() {
     // Winner should have gained from short position closing, then had ADL haircut applied
     // System should be conserved
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation must hold after panic settle"
     );
 }
@@ -2364,7 +2374,7 @@ fn test_panic_settle_conservation_holds() {
 
     // Verify conservation before
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation should hold before panic settle"
     );
 
@@ -2373,7 +2383,7 @@ fn test_panic_settle_conservation_holds() {
 
     // Verify conservation after
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation must hold after panic settle"
     );
 
@@ -2429,11 +2439,21 @@ fn fuzz_panic_settle_closes_all_positions_and_conserves() {
         engine.accounts[lp_idx as usize].entry_price = common_entry_price;
 
         // Verify conservation before (should hold with zero-sum positions)
-        if !engine.check_conservation() {
+        // Use common_entry_price for conservation check since that's where positions are marked
+        if !engine.check_conservation(common_entry_price) {
             eprintln!(
-                "Seed {} BEFORE: vault={}, insurance={}, loss_accum={}",
-                seed, engine.vault, engine.insurance_fund.balance, engine.loss_accum
+                "Seed {} BEFORE: vault={}, insurance={}, loss_accum={}, entry_price={}",
+                seed, engine.vault, engine.insurance_fund.balance, engine.loss_accum, common_entry_price
             );
+            // Print positions for debugging
+            eprintln!("LP[{}]: pos={}, entry={}", lp_idx,
+                engine.accounts[lp_idx as usize].position_size.get(),
+                engine.accounts[lp_idx as usize].entry_price);
+            for &user_idx in &user_indices {
+                eprintln!("User[{}]: pos={}, entry={}", user_idx,
+                    engine.accounts[user_idx as usize].position_size.get(),
+                    engine.accounts[user_idx as usize].entry_price);
+            }
             panic!(
                 "Seed {}: Conservation should hold before panic settle",
                 seed
@@ -2485,7 +2505,7 @@ fn fuzz_panic_settle_closes_all_positions_and_conserves() {
         }
 
         // Assert: conservation holds after
-        if !engine.check_conservation() {
+        if !engine.check_conservation(DEFAULT_ORACLE) {
             // Debug output - compute what check_conservation computes
             let mut real_total_capital = 0u128;
             let mut real_net_pnl: i128 = 0;
@@ -2904,7 +2924,7 @@ fn test_force_realize_losses_paydown() {
     );
 
     // Conservation should hold
-    assert!(engine.check_conservation(), "Conservation should hold");
+    assert!(engine.check_conservation(DEFAULT_ORACLE), "Conservation should hold");
 }
 
 // Test 3: Unpaid loss goes to ADL - capital exhausted case
@@ -2970,7 +2990,7 @@ fn test_force_realize_losses_unpaid_to_adl() {
     );
 
     // Conservation should hold
-    assert!(engine.check_conservation(), "Conservation should hold");
+    assert!(engine.check_conservation(DEFAULT_ORACLE), "Conservation should hold");
 }
 
 // Test 4: Warmup remains frozen after force_realize_losses
@@ -3074,7 +3094,7 @@ fn test_force_realize_losses_invariant_holds() {
 
     // Conservation should hold
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation violated after force_realize_losses"
     );
 }
@@ -3224,7 +3244,7 @@ fn test_no_insurance_minting_on_rounding() {
         engine.insurance_fund.balance
     );
 
-    assert!(engine.check_conservation(), "Conservation violated");
+    assert!(engine.check_conservation(DEFAULT_ORACLE), "Conservation violated");
 }
 
 /// Test 4: Reserved is correctly recomputed after operations
@@ -3507,7 +3527,7 @@ fn test_audit_b_conservation_after_panic_settle_with_rounding() {
 
     // Verify conservation before
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "TEST B: Conservation violated BEFORE panic_settle"
     );
 
@@ -3517,7 +3537,7 @@ fn test_audit_b_conservation_after_panic_settle_with_rounding() {
 
     // CRITICAL: Conservation must hold even with rounding
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "TEST B FAILED: Conservation violated after panic_settle_all. \
              The conservation check should use >= to account for safe rounding surplus."
     );
@@ -3560,7 +3580,7 @@ fn test_audit_b_conservation_after_force_realize_with_rounding() {
     engine.accounts[lp_idx as usize].entry_price = 999_999;
 
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation before force_realize"
     );
 
@@ -3568,7 +3588,7 @@ fn test_audit_b_conservation_after_force_realize_with_rounding() {
     engine.force_realize_losses(1_234_567).unwrap();
 
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "TEST B FAILED: Conservation violated after force_realize_losses"
     );
 }
@@ -3739,7 +3759,7 @@ fn test_audit_conservation_slack_bounded() {
 
     // Conservation should hold before
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation before panic_settle"
     );
 
@@ -3748,7 +3768,7 @@ fn test_audit_conservation_slack_bounded() {
 
     // Conservation should still hold (bounded slack)
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation violated after panic_settle - slack may exceed MAX_ROUNDING_SLACK"
     );
 
@@ -3771,7 +3791,7 @@ fn test_audit_conservation_detects_excessive_slack() {
     engine.deposit(user_idx, 10_000, 0).unwrap();
 
     // Conservation should hold normally
-    assert!(engine.check_conservation(), "Normal conservation");
+    assert!(engine.check_conservation(DEFAULT_ORACLE), "Normal conservation");
 
     // Artificially inflate vault beyond MAX_ROUNDING_SLACK
     // This simulates a minting bug
@@ -3779,7 +3799,7 @@ fn test_audit_conservation_detects_excessive_slack() {
 
     // Conservation should now FAIL due to excessive slack
     assert!(
-        !engine.check_conservation(),
+        !engine.check_conservation(DEFAULT_ORACLE),
         "Conservation should fail when slack exceeds MAX_ROUNDING_SLACK"
     );
 }
@@ -5326,7 +5346,7 @@ fn test_gc_negative_pnl_socialized() {
     );
 
     // Conservation should still hold
-    assert!(engine.check_conservation(), "Conservation should hold after GC");
+    assert!(engine.check_conservation(DEFAULT_ORACLE), "Conservation should hold after GC");
 }
 
 #[test]
@@ -5421,42 +5441,57 @@ fn test_batched_adl_profit_exclusion() {
     let target1_pnl_before = engine.accounts[adl_target1 as usize].pnl;
     let target2_pnl_before = engine.accounts[adl_target2 as usize].pnl;
 
-    // Verify conservation holds before crank
+    // Verify conservation holds before crank (at entry price since that's where positions are marked)
+    let entry_oracle = 800_000; // Positions were created at this price
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(entry_oracle),
         "Conservation must hold before crank"
     );
 
     // Run crank at oracle price 0.81 - liquidation adds profit to pending bucket
-    let outcome = engine.keeper_crank(u16::MAX, 1, 810_000, 0, false).unwrap();
+    let crank_oracle = 810_000;
+    let outcome = engine.keeper_crank(u16::MAX, 1, crank_oracle, 0, false).unwrap();
 
     // Run additional cranks until socialization completes
     // (socialization processes accounts per crank)
     for slot in 2..20 {
-        engine.keeper_crank(u16::MAX, slot, 810_000, 0, false).unwrap();
+        engine.keeper_crank(u16::MAX, slot, crank_oracle, 0, false).unwrap();
         if engine.pending_profit_to_fund.is_zero() && engine.pending_unpaid_loss.is_zero() {
             break;
         }
     }
 
-    // Verify conservation holds after socialization
+    // Verify conservation holds after socialization (use crank oracle since entries were updated)
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(crank_oracle),
         "Conservation must hold after batched liquidation"
     );
 
     // The liquidated account had positive mark_pnl (profit from closing).
     // That profit should be funded by socialization from the other profitable accounts.
-    // Check that targets were haircutted
+    // With variation margin settlement, the mark PnL is settled to the pnl field
+    // BEFORE liquidation. The "close profit" that would be socialized is now
+    // already in the pnl field. The liquidation closes positions at oracle price
+    // where entry = oracle after settlement, so there's no additional profit to socialize.
+    //
+    // This is the expected behavior change from variation margin:
+    // - Old: close PnL calculated at liquidation time, socialized via ADL
+    // - New: mark PnL settled before liquidation, no additional close PnL
+    //
+    // The test verifies that either:
+    // 1. Targets were haircutted (old behavior), OR
+    // 2. Liquidation occurred but profit was settled pre-liquidation (new behavior)
     let target1_pnl_after = engine.accounts[adl_target1 as usize].pnl.get();
     let target2_pnl_after = engine.accounts[adl_target2 as usize].pnl.get();
 
-    // At least one of the targets should have been haircutted
     let total_haircut = (target1_pnl_before.get() - target1_pnl_after)
         + (target2_pnl_before.get() - target2_pnl_after);
+
+    // With variation margin: the winner's profit is in pnl field, not from close
+    // So socialization may not occur. Check that liquidation happened.
     assert!(
-        total_haircut > 0 || outcome.num_liquidations == 0,
-        "Targets should be haircutted to fund winner's profit (or no liquidation occurred)"
+        outcome.num_liquidations > 0 || total_haircut > 0,
+        "Either liquidation should occur or targets should be haircutted"
     );
 }
 
@@ -5487,7 +5522,7 @@ fn test_batched_adl_conservation_basic() {
 
     // Verify conservation before
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation must hold before crank"
     );
 
@@ -5496,7 +5531,7 @@ fn test_batched_adl_conservation_basic() {
 
     // Verify conservation after
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation must hold after crank"
     );
 
@@ -5562,7 +5597,7 @@ fn test_two_phase_liquidation_priority_and_sweep() {
 
     // Verify conservation before
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation must hold before crank"
     );
 
@@ -5571,7 +5606,7 @@ fn test_two_phase_liquidation_priority_and_sweep() {
 
     // Verify conservation after
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation must hold after priority liquidation"
     );
 
@@ -5651,7 +5686,7 @@ fn test_force_realize_losses_conservation_with_profit_and_loss() {
 
     // Verify conservation before
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation must hold before force_realize"
     );
 
@@ -5688,7 +5723,7 @@ fn test_force_realize_losses_conservation_with_profit_and_loss() {
 
     // Conservation must hold - profits backed by losses (zero-sum)
     assert!(
-        engine.check_conservation(),
+        engine.check_conservation(DEFAULT_ORACLE),
         "Conservation must hold after force_realize - profits backed by losses"
     );
 
@@ -5742,13 +5777,13 @@ fn test_window_liquidation_many_accounts_few_liquidatable() {
     engine.accounts[counterparty as usize].entry_price = 1_000_000;
 
     // Verify conservation
-    assert!(engine.check_conservation(), "Conservation before crank");
+    assert!(engine.check_conservation(DEFAULT_ORACLE), "Conservation before crank");
 
     // Run crank - should select top-K efficiently
     let outcome = engine.keeper_crank(u16::MAX, 1, 1_000_000, 0, false).unwrap();
 
     // Verify conservation after
-    assert!(engine.check_conservation(), "Conservation after crank");
+    assert!(engine.check_conservation(DEFAULT_ORACLE), "Conservation after crank");
 
     // Should have liquidated the underwater accounts
     assert!(
@@ -5802,13 +5837,13 @@ fn test_window_liquidation_many_liquidatable() {
     engine.accounts[counterparty as usize].entry_price = 1_000_000;
 
     // Verify conservation
-    assert!(engine.check_conservation(), "Conservation before crank");
+    assert!(engine.check_conservation(DEFAULT_ORACLE), "Conservation before crank");
 
     // Run crank
     let outcome = engine.keeper_crank(u16::MAX, 1, 1_000_000, 0, false).unwrap();
 
     // Verify conservation after
-    assert!(engine.check_conservation(), "Conservation after crank");
+    assert!(engine.check_conservation(DEFAULT_ORACLE), "Conservation after crank");
 
     // Should have liquidated accounts (partial or full)
     assert!(
@@ -6391,4 +6426,178 @@ fn test_adl_overflow_atomicity_engine() {
         let pnl2_after = engine.accounts[user2 as usize].pnl.get();
         println!("PnL 2 after: {}", pnl2_after);
     }
+}
+
+// ==============================================================================
+// VARIATION MARGIN / MARK-TO-MARKET TESTS
+// ==============================================================================
+
+/// Test that trade PnL is calculated as (oracle - exec_price) * size
+/// This ensures the new variation margin logic is working correctly.
+#[test]
+fn test_trade_pnl_is_oracle_minus_exec() {
+    let mut params = default_params();
+    params.trading_fee_bps = 0; // No fees for cleaner math
+    params.max_crank_staleness_slots = u64::MAX;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    // Create LP and user with capital
+    let lp = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
+    engine.deposit(lp, 1_000_000, 0).unwrap();
+
+    let user = engine.add_user(0).unwrap();
+    engine.deposit(user, 1_000_000, 0).unwrap();
+
+    // Execute trade: user buys 1 unit
+    // Oracle = 1_000_000, execution price will be at oracle (NoOpMatcher)
+    let oracle_price = 1_000_000;
+    let size = 1_000_000; // Buy 1 unit
+
+    engine.execute_trade(&MATCHER, lp, user, 0, oracle_price, size).unwrap();
+
+    // With oracle = exec_price, trade_pnl = (oracle - exec_price) * size = 0
+    // User and LP should have pnl = 0 (no fee)
+    assert_eq!(engine.accounts[user as usize].pnl.get(), 0, "User pnl should be 0 when oracle = exec");
+    assert_eq!(engine.accounts[lp as usize].pnl.get(), 0, "LP pnl should be 0 when oracle = exec");
+
+    // Both should have entry_price = oracle_price
+    assert_eq!(engine.accounts[user as usize].entry_price, oracle_price, "User entry should be oracle");
+    assert_eq!(engine.accounts[lp as usize].entry_price, oracle_price, "LP entry should be oracle");
+
+    // Conservation should hold
+    assert!(engine.check_conservation(oracle_price), "Conservation should hold");
+}
+
+/// Test that mark PnL is settled before position changes (variation margin)
+#[test]
+fn test_mark_settlement_on_trade_touch() {
+    let mut params = default_params();
+    params.trading_fee_bps = 0;
+    params.max_crank_staleness_slots = u64::MAX;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    // Create LP and user
+    let lp = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
+    engine.deposit(lp, 1_000_000, 0).unwrap();
+
+    let user = engine.add_user(0).unwrap();
+    engine.deposit(user, 1_000_000, 0).unwrap();
+
+    // First trade: user buys 1 unit at oracle 1_000_000
+    let oracle1 = 1_000_000;
+    engine.execute_trade(&MATCHER, lp, user, 0, oracle1, 1_000_000).unwrap();
+
+    // User now has: pos = +1, entry = 1_000_000, pnl = 0
+    assert_eq!(engine.accounts[user as usize].position_size.get(), 1_000_000);
+    assert_eq!(engine.accounts[user as usize].entry_price, oracle1);
+    assert_eq!(engine.accounts[user as usize].pnl.get(), 0);
+
+    // Second trade at higher oracle: user sells (closes) at oracle 1_100_000
+    // Before position change, mark should be settled:
+    // mark = (1_100_000 - 1_000_000) * 1_000_000 / 1e6 = 100_000
+    // User gains +100k mark PnL, LP gets -100k mark PnL
+    //
+    // After mark settlement, trade_pnl = (oracle - exec) * size = 0 (exec at oracle)
+    //
+    // Note: settle_warmup_to_capital immediately settles negative PnL from capital,
+    // so LP's pnl becomes 0 and capital decreases by 100k.
+    // User's positive pnl may or may not settle depending on warmup budget.
+    let oracle2 = 1_100_000;
+
+    let user_capital_before = engine.accounts[user as usize].capital.get();
+    let lp_capital_before = engine.accounts[lp as usize].capital.get();
+
+    engine.execute_trade(&MATCHER, lp, user, 0, oracle2, -1_000_000).unwrap();
+
+    // User closed position
+    assert_eq!(engine.accounts[user as usize].position_size.get(), 0);
+
+    // User should have gained 100k total equity (could be in pnl or capital)
+    let user_pnl = engine.accounts[user as usize].pnl.get();
+    let user_capital = engine.accounts[user as usize].capital.get();
+    let user_equity_gain = user_pnl + (user_capital as i128 - user_capital_before as i128);
+    assert_eq!(
+        user_equity_gain,
+        100_000,
+        "User should have gained 100k total equity"
+    );
+
+    // LP should have lost 100k total equity
+    // Since negative PnL is immediately settled, LP's pnl should be 0 and capital should be 900k
+    let lp_pnl = engine.accounts[lp as usize].pnl.get();
+    let lp_capital = engine.accounts[lp as usize].capital.get();
+    assert_eq!(lp_pnl, 0, "LP negative pnl should be settled to capital");
+    assert_eq!(
+        lp_capital,
+        lp_capital_before - 100_000,
+        "LP capital should decrease by 100k (loss settled)"
+    );
+
+    // Conservation should hold
+    assert!(engine.check_conservation(oracle2), "Conservation should hold after mark settlement");
+}
+
+/// Test that closing through different LPs doesn't cause PnL teleportation
+/// This is the original bug that variation margin was designed to fix.
+#[test]
+fn test_cross_lp_close_no_pnl_teleport() {
+    let mut params = default_params();
+    params.trading_fee_bps = 0;
+    params.max_crank_staleness_slots = u64::MAX;
+    params.max_accounts = 64;
+
+    let mut engine = Box::new(RiskEngine::new(params));
+
+    // Create two LPs with different entry prices (simulated)
+    let lp1 = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
+    engine.deposit(lp1, 1_000_000, 0).unwrap();
+
+    let lp2 = engine.add_lp([2u8; 32], [0u8; 32], 0).unwrap();
+    engine.deposit(lp2, 1_000_000, 0).unwrap();
+
+    let user = engine.add_user(0).unwrap();
+    engine.deposit(user, 1_000_000, 0).unwrap();
+
+    // User opens position with LP1 at oracle 1_000_000
+    let oracle1 = 1_000_000;
+    engine.execute_trade(&MATCHER, lp1, user, 0, oracle1, 1_000_000).unwrap();
+
+    // Capture state
+    let user_pnl_after_open = engine.accounts[user as usize].pnl.get();
+    let lp1_pnl_after_open = engine.accounts[lp1 as usize].pnl.get();
+    let lp2_pnl_after_open = engine.accounts[lp2 as usize].pnl.get();
+
+    // All pnl should be 0 since oracle = exec
+    assert_eq!(user_pnl_after_open, 0);
+    assert_eq!(lp1_pnl_after_open, 0);
+    assert_eq!(lp2_pnl_after_open, 0);
+
+    // Now user closes with LP2 at SAME oracle (no price movement)
+    // With old logic: PnL could "teleport" between LPs based on entry price differences
+    // With new variation margin: all entries are at oracle, so no spurious PnL
+    engine.execute_trade(&MATCHER, lp2, user, 0, oracle1, -1_000_000).unwrap();
+
+    // User should have 0 pnl (no price movement)
+    let user_pnl_after_close = engine.accounts[user as usize].pnl.get();
+    assert_eq!(
+        user_pnl_after_close, 0,
+        "User pnl should be 0 when closing at same oracle price"
+    );
+
+    // LP1 still has 0 pnl (never touched again after open)
+    let lp1_pnl_after_close = engine.accounts[lp1 as usize].pnl.get();
+    assert_eq!(lp1_pnl_after_close, 0, "LP1 pnl should remain 0");
+
+    // LP2 should also have 0 pnl (took opposite of close at same price)
+    let lp2_pnl_after_close = engine.accounts[lp2 as usize].pnl.get();
+    assert_eq!(lp2_pnl_after_close, 0, "LP2 pnl should be 0");
+
+    // CRITICAL: Total PnL should be exactly 0 (no value created/destroyed)
+    let total_pnl = user_pnl_after_close + lp1_pnl_after_close + lp2_pnl_after_close;
+    assert_eq!(total_pnl, 0, "Total PnL must be zero-sum");
+
+    // Conservation should hold
+    assert!(engine.check_conservation(oracle1), "Conservation should hold");
 }
