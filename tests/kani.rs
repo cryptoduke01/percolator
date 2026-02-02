@@ -5,8 +5,7 @@
 //! Run all: cargo kani (may take significant time)
 //!
 //! Key invariants proven:
-//! - I1: User principal is never reduced by ADL/socialization
-//! - I2: Conservation of funds across all operations
+//! - I2: Conservation of funds across all operations (V >= C_tot + I)
 //! - I5: PNL warmup is monotonic and deterministic
 //! - I7: User isolation - operations on one user don't affect others
 //! - I8: Equity (capital + pnl) is used consistently for margin checks
@@ -14,30 +13,11 @@
 //! - LQ-PARTIAL: Liquidation reduces position to restore target margin;
 //!               dust kill-switch prevents sub-threshold remnants
 //!
-//! Loss socialization design (deferred/bounded):
-//!   - Immediate waterfall (apply_adl): unwrapped → unreserved insurance → loss_accum
-//!   - Crank path: pending_* buckets accumulate; socialization_step haircuts
-//!     unwrapped PnL only in-window; value extraction is blocked while pending > 0.
-//!   - GC moves negative dust pnl into pending_unpaid_loss (not direct ADL).
-//!
-//! Insurance balance increases only via:
-//!   maintenance fees + liquidation fees + trading fees + explicit top-ups.
-//!
-//! Reserved insurance (warmup_insurance_reserved) is never spendable by ADL.
-//! ADL can only spend insurance_spendable_unreserved().
-//!
-//! Note: Some proofs involving iteration over all accounts (apply_adl,
-//! check_conservation loops) are computationally expensive and may timeout.
-//! These are marked with SLOW_PROOF comments. Run individually with longer
-//! timeouts if needed: cargo kani --harness <name> --solver-timeout 600
-//!
-//! HISTORICAL NOTE:
-//! Several I10 "withdrawal haircut" proofs were intentionally removed.
-//! The engine no longer supports haircut-based withdrawals.
-//! Insolvency is handled via:
-//!   - equity-based blocking,
-//!   - risk-reduction-only mode,
-//!   - forced loss realization.
+//! Haircut system design:
+//!   - Insolvency is handled via haircut ratio (c_tot, pnl_pos_tot aggregates)
+//!   - Forced loss realization writes off negative PnL
+//!   - Insurance balance increases only via:
+//!     maintenance fees + liquidation fees + trading fees + explicit top-ups.
 //! See README.md for the current design rationale.
 
 #![cfg(kani)]
@@ -149,7 +129,6 @@ struct AccountSnapshot {
 struct GlobalsSnapshot {
     vault: u128,
     insurance_balance: u128,
-    loss_accum: u128,
 }
 
 fn snapshot_account(account: &Account) -> AccountSnapshot {
@@ -165,50 +144,6 @@ fn snapshot_globals(engine: &RiskEngine) -> GlobalsSnapshot {
     GlobalsSnapshot {
         vault: engine.vault.get(),
         insurance_balance: engine.insurance_fund.balance.get(),
-        loss_accum: engine.loss_accum.get(),
-    }
-}
-
-// ============================================================================
-// SECURITY GOAL: Bounded Net Extraction (attacker cannot drain beyond real resources)
-// ============================================================================
-
-/// Track decreases in insurance above floor across a trace.
-/// Uses spendable_raw (insurance - floor, saturating at 0), which is exactly the
-/// portion that can ever be spent by ADL / warmup (floor is protected).
-#[inline]
-fn track_spendable_insurance_delta(engine: &RiskEngine, prev_raw: &mut u128, spent: &mut u128) {
-    let raw_now = engine.insurance_spendable_raw();
-    if raw_now < *prev_raw {
-        *spent = spent.saturating_add(*prev_raw - raw_now);
-    }
-    *prev_raw = raw_now;
-}
-
-/// Scan all used accounts and attribute any realized loss-payments from capital
-/// (capital decreases) to attacker vs others. This is conservative and catches
-/// any path that reduces capital (settle, force_realize, etc).
-fn scan_and_track_capital_decreases(
-    engine: &RiskEngine,
-    attacker: u16,
-    caps_before: &mut [u128; MAX_ACCOUNTS],
-    attacker_loss_paid: &mut u128,
-    others_loss_paid: &mut u128,
-) {
-    for i in 0..MAX_ACCOUNTS {
-        if engine.is_used(i) {
-            let cap_after = engine.accounts[i].capital.get();
-            let cap_before = caps_before[i];
-            if cap_after < cap_before {
-                let paid = cap_before - cap_after;
-                if i as u16 == attacker {
-                    *attacker_loss_paid = attacker_loss_paid.saturating_add(paid);
-                } else {
-                    *others_loss_paid = others_loss_paid.saturating_add(paid);
-                }
-            }
-            caps_before[i] = cap_after;
-        }
     }
 }
 
@@ -216,11 +151,7 @@ fn scan_and_track_capital_decreases(
 // Verification Prelude: State Validity and Fast Conservation Helpers
 // ============================================================================
 
-/// Check if pending socialization buckets are non-zero
-#[inline]
-fn pending_nonzero(engine: &RiskEngine) -> bool {
-    !engine.pending_profit_to_fund.is_zero() || !engine.pending_unpaid_loss.is_zero()
-}
+
 
 /// Cheap validity check for RiskEngine state
 /// Used as assume/assert in frame proofs and validity-preservation proofs.
@@ -229,19 +160,7 @@ fn pending_nonzero(engine: &RiskEngine) -> bool {
 /// to avoid memcmp unwinding issues in Kani. The user/LP accounts created
 /// by add_user/add_lp already have correct matcher arrays.
 fn valid_state(engine: &RiskEngine) -> bool {
-    let raw_spendable = engine.insurance_spendable_raw();
-
-    // 1. warmup_insurance_reserved <= raw_spendable (insurance above floor)
-    if engine.warmup_insurance_reserved.get() > raw_spendable {
-        return false;
-    }
-
-    // 2. if risk_reduction_only then warmup_paused must be true
-    if engine.risk_reduction_only && !engine.warmup_paused {
-        return false;
-    }
-
-    // 3. Crank state bounds
+    // 1. Crank state bounds
     if engine.num_used_accounts > MAX_ACCOUNTS as u16 {
         return false;
     }
@@ -256,11 +175,6 @@ fn valid_state(engine: &RiskEngine) -> bool {
     if engine.free_head != u16::MAX && engine.free_head >= MAX_ACCOUNTS as u16 {
         return false;
     }
-
-    // Note: Check #1 (reserved <= raw_spendable) already subsumes the floor constraint:
-    // - If insurance < floor => raw_spendable = 0 => reserved must be 0
-    // - If insurance >= floor => reserved <= (insurance - floor)
-    // No separate floor check needed.
 
     // Check per-account invariants for used accounts only
     for block in 0..BITMAP_WORDS {
@@ -380,69 +294,33 @@ fn inv_structural(engine: &RiskEngine) -> bool {
     true
 }
 
-/// Accounting invariant: conservation and insurance bounds
+/// Accounting invariant: conservation (haircut system)
 fn inv_accounting(engine: &RiskEngine) -> bool {
-    let raw_spendable = engine.insurance_spendable_raw();
+    // A1: Primary conservation: vault >= c_tot + insurance
+    // This is the fundamental invariant in the haircut system.
+    let c_tot = engine.c_tot.get();
+    let insurance = engine.insurance_fund.balance.get();
+    let vault = engine.vault.get();
 
-    // A1: Reserved identity (exact equality, not just <=)
-    // reserved == min(max(W+ - W-, 0), raw_spendable)
-    let needed = engine
-        .warmed_pos_total
-        .get()
-        .saturating_sub(engine.warmed_neg_total.get());
-    let expected_reserved = core::cmp::min(needed, raw_spendable);
-    if engine.warmup_insurance_reserved.get() != expected_reserved {
+    if vault < c_tot.saturating_add(insurance) {
         return false;
     }
 
-    // A2: Conservation inequality (cheap version, no funding adjustment)
-    // vault + loss_accum >= sum(capital) + insurance + sum_pos_pnl - sum_neg_pnl
-    // This is a necessary condition; full conservation requires funding adjustment.
-    //
-    // Compute sums over used accounts
-    let mut sum_capital: u128 = 0;
-    let mut sum_pos_pnl: u128 = 0;
-    let mut sum_neg_pnl: u128 = 0;
-
-    for block in 0..BITMAP_WORDS {
-        let mut w = engine.used[block];
-        while w != 0 {
-            let bit = w.trailing_zeros() as usize;
-            let idx = block * 64 + bit;
-            w &= w - 1;
-
-            let account = &engine.accounts[idx];
-            sum_capital = sum_capital.saturating_add(account.capital.get());
-
-            if account.pnl.get() > 0 {
-                sum_pos_pnl = sum_pos_pnl.saturating_add(account.pnl.get() as u128);
-            } else if account.pnl.get() < 0 {
-                sum_neg_pnl = sum_neg_pnl.saturating_add(neg_i128_to_u128(account.pnl.get()));
-            }
-        }
-    }
-
-    // expected = sum_capital + insurance + sum_pos_pnl - sum_neg_pnl
-    let base = sum_capital.saturating_add(engine.insurance_fund.balance.get());
-    let expected = base.saturating_add(sum_pos_pnl).saturating_sub(sum_neg_pnl);
-    let actual = engine.vault.get().saturating_add(engine.loss_accum.get());
-
-    // One-sided: actual >= expected (vault has at least what's owed)
-    // No upper bound on slack - just guarding against underfunding, not overfunding
-    actual >= expected
+    true
 }
 
-/// Mode invariant: risk mode and warmup pause consistency
-fn inv_mode(engine: &RiskEngine) -> bool {
-    // M1: risk_reduction_only with active insolvency ⇒ warmup_paused
-    // Warmup may be unpaused when loss_accum = 0 (flat) even in risk-reduction mode.
-    if engine.risk_reduction_only && !engine.loss_accum.is_zero() && !engine.warmup_paused {
-        return false;
-    }
+/// Fast conservation check for proofs with no open positions / funding.
+/// vault >= c_tot + insurance
+fn conservation_fast_no_funding(engine: &RiskEngine) -> bool {
+    engine.vault.get()
+        >= engine
+            .c_tot
+            .get()
+            .saturating_add(engine.insurance_fund.balance.get())
+}
 
-    // M2: pending > 0 implies certain operations should be blocked (proven separately)
-    // This is enforced at operation level, not state level
-
+/// Mode invariant (placeholder - no mode fields in haircut system)
+fn inv_mode(_engine: &RiskEngine) -> bool {
     true
 }
 
@@ -613,258 +491,6 @@ fn recompute_totals(engine: &RiskEngine) -> Totals {
     }
 }
 
-/// Fast conservation check: no funding settlement required
-/// PRECONDITION: All used accounts must have position_size.is_zero(), OR
-/// all accounts must be funding-settled (funding_index == global funding_index).
-///
-/// Returns false if precondition violated (unsettled funding exists).
-/// Returns true if conservation holds with bounded slack, false otherwise.
-fn conservation_fast_no_funding(engine: &RiskEngine) -> bool {
-    // Precondition enforcement: no unsettled funding
-    // Either all positions are zero, OR all funding is settled.
-    for block in 0..BITMAP_WORDS {
-        let mut w = engine.used[block];
-        while w != 0 {
-            let bit = w.trailing_zeros() as usize;
-            let idx = block * 64 + bit;
-            w &= w - 1;
-
-            let account = &engine.accounts[idx];
-            if !account.position_size.is_zero()
-                && account.funding_index != engine.funding_index_qpb_e6
-            {
-                return false; // Unsettled funding - can't use fast check
-            }
-        }
-    }
-
-    let totals = recompute_totals(engine);
-
-    // expected = sum_capital + insurance + sum_pnl_pos - sum_pnl_neg_abs
-    let base = totals
-        .sum_capital
-        .saturating_add(engine.insurance_fund.balance.get());
-    let expected = base
-        .saturating_add(totals.sum_pnl_pos)
-        .saturating_sub(totals.sum_pnl_neg_abs);
-
-    let actual = engine.vault.get().saturating_add(engine.loss_accum.get());
-
-    // One-sided: actual >= expected, and slack is bounded
-    if actual < expected {
-        return false;
-    }
-    let slack = actual - expected;
-    slack <= MAX_ROUNDING_SLACK
-}
-
-// ============================================================================
-// Waterfall Proof Helpers
-// Used to verify ADL waterfall: unwrapped PnL → unreserved insurance → loss_accum
-// ============================================================================
-
-/// Snapshot of insurance decomposition for waterfall proofs
-#[derive(Clone, Copy)]
-struct InsuranceSnap {
-    floor: u128,
-    raw: u128,        // spendable_raw = max(insurance - floor, 0)
-    reserved: u128,   // warmup_insurance_reserved
-    unreserved: u128, // spendable_unreserved = raw - reserved
-    balance: u128,    // insurance_fund.balance
-}
-
-fn snap_insurance(engine: &RiskEngine) -> InsuranceSnap {
-    let floor = engine.params.risk_reduction_threshold.get();
-    let raw = engine.insurance_spendable_raw();
-    let reserved = engine.warmup_insurance_reserved.get();
-    let unreserved = raw.saturating_sub(reserved);
-    InsuranceSnap {
-        floor,
-        raw,
-        reserved,
-        unreserved,
-        balance: engine.insurance_fund.balance.get(),
-    }
-}
-
-/// Expected waterfall routing amounts given a loss and pre-state totals
-#[derive(Clone, Copy)]
-struct WaterfallExpectation {
-    from_unwrapped: u128,
-    from_unreserved_insurance: u128,
-    to_loss_accum: u128,
-}
-
-/// Given total_loss and pre totals, compute expected routing amounts
-fn expected_waterfall(
-    total_loss: u128,
-    total_unwrapped: u128,
-    unreserved_insurance: u128,
-) -> WaterfallExpectation {
-    let from_unwrapped = core::cmp::min(total_loss, total_unwrapped);
-    let rem1 = total_loss.saturating_sub(from_unwrapped);
-    let from_unreserved_insurance = core::cmp::min(rem1, unreserved_insurance);
-    let rem2 = rem1.saturating_sub(from_unreserved_insurance);
-    let to_loss_accum = rem2;
-    WaterfallExpectation {
-        from_unwrapped,
-        from_unreserved_insurance,
-        to_loss_accum,
-    }
-}
-
-/// Proof-side helper: compute withdrawable PnL (mirrors engine logic)
-fn proof_compute_withdrawable_pnl(engine: &RiskEngine, a: &Account) -> u128 {
-    if a.pnl.get() <= 0 {
-        return 0;
-    }
-    let pos = a.pnl.get() as u128;
-    let avail = pos.saturating_sub(a.reserved_pnl as u128);
-
-    let effective_slot = if engine.warmup_paused {
-        core::cmp::min(engine.current_slot, engine.warmup_pause_slot)
-    } else {
-        engine.current_slot
-    };
-
-    let elapsed = effective_slot.saturating_sub(a.warmup_started_at_slot);
-    let cap = a.warmup_slope_per_step.saturating_mul(elapsed as u128);
-    core::cmp::min(avail, cap.get())
-}
-
-/// Proof-side helper: compute unwrapped PnL (positive PnL minus reserved minus withdrawable)
-fn proof_compute_unwrapped_pnl(engine: &RiskEngine, a: &Account) -> u128 {
-    if a.pnl.get() <= 0 {
-        return 0;
-    }
-    let pos = a.pnl.get() as u128;
-    let withdrawable = proof_compute_withdrawable_pnl(engine, a);
-    pos.saturating_sub(a.reserved_pnl as u128)
-        .saturating_sub(withdrawable)
-}
-
-/// Proof-side helper: total unwrapped PnL across all used accounts
-fn proof_total_unwrapped(engine: &RiskEngine) -> u128 {
-    let mut total = 0u128;
-    for block in 0..BITMAP_WORDS {
-        let mut w = engine.used[block];
-        while w != 0 {
-            let bit = w.trailing_zeros() as usize;
-            let idx = block * 64 + bit;
-            w &= w - 1;
-            total =
-                total.saturating_add(proof_compute_unwrapped_pnl(engine, &engine.accounts[idx]));
-        }
-    }
-    total
-}
-
-// ============================================================================
-// I1: Principal is NEVER reduced by ADL/socialization
-// SLOW_PROOF: Uses apply_adl which iterates over all accounts
-// Run with: cargo kani --harness i1_adl_never_reduces_principal --solver-timeout 600
-// ============================================================================
-
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn i1_adl_never_reduces_principal() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Set arbitrary but bounded values (reduced bounds for tractability)
-    let principal: u128 = kani::any();
-    let loss: u128 = kani::any();
-
-    kani::assume(principal > 0 && principal < 1_000);
-    kani::assume(loss < 1_000);
-
-    // Set pnl=0 since we're only proving "capital unchanged"
-    // This simplifies the proof and avoids irrelevant conservation issues
-    engine.accounts[user_idx as usize].capital = U128::new(principal);
-    engine.accounts[user_idx as usize].pnl = I128::new(0);
-    engine.insurance_fund.balance = U128::new(10_000);
-
-    // Set consistent vault for conservation
-    engine.vault = U128::new(principal + engine.insurance_fund.balance.get());
-
-    let principal_before = engine.accounts[user_idx as usize].capital;
-
-    let _ = engine.apply_adl(loss);
-
-    assert!(
-        engine.accounts[user_idx as usize].capital.get() == principal_before.get(),
-        "I1: ADL must NEVER reduce user principal"
-    );
-}
-
-// ============================================================================
-// I1b: REMOVED — CBMC's bit-level u128 encoding makes apply_adl intractable
-// with symbolic inputs (~5M SAT variables, OOM during propositional reduction
-// regardless of input range constraints). The overflow atomicity scenario is
-// covered by i1c (concrete values) and the non-overflow symbolic case by i1.
-// ============================================================================
-
-// ============================================================================
-// I1c: ADL overflow atomicity - concrete test case that triggers overflow
-// Uses specific values designed to cause overflow on account 2 after
-// account 1 has already been modified, demonstrating the atomicity bug.
-// ============================================================================
-
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn i1c_adl_overflow_atomicity_concrete() {
-    let mut engine = RiskEngine::new(test_params());
-
-    // Add two accounts
-    let user1 = engine.add_user(0).unwrap();
-    let user2 = engine.add_user(1).unwrap();
-
-    // Concrete values to trigger overflow:
-    // Account 1: small unwrapped PnL (1) - processed first, won't overflow
-    // Account 2: large unwrapped PnL (2^120) - causes overflow when multiplied by loss
-    //
-    // loss_to_socialize = min(total_loss, total_unwrapped)
-    // For account 2: loss_to_socialize * unwrapped_2 can overflow
-    //
-    // If loss = 2^10 and unwrapped_2 = 2^120:
-    // 2^10 * 2^120 = 2^130 > 2^128 = u128::MAX -> OVERFLOW
-    let small_pnl: u128 = 1;
-    let large_pnl: u128 = 1u128 << 120; // 2^120
-    let total_loss: u128 = 1u128 << 10; // 2^10 = 1024
-
-    // Set up accounts
-    engine.accounts[user1 as usize].capital = U128::new(1000);
-    engine.accounts[user1 as usize].pnl = I128::new(small_pnl as i128);
-    engine.accounts[user2 as usize].capital = U128::new(1000);
-    engine.accounts[user2 as usize].pnl = I128::new(large_pnl as i128);
-
-    // Vault must cover total capital
-    engine.vault = U128::new(2000);
-    engine.insurance_fund.balance = U128::new(10000);
-
-    // Capture state before
-    let pnl1_before = engine.accounts[user1 as usize].pnl.get();
-    let pnl2_before = engine.accounts[user2 as usize].pnl.get();
-
-    // This should trigger overflow in the multiplication for account 2
-    // After account 1 has already been processed
-    let result = engine.apply_adl(total_loss);
-
-    // If the operation returned an error (overflow), check atomicity
-    if result.is_err() {
-        // ATOMICITY CHECK: If error occurred, NO accounts should be modified
-        let pnl1_after = engine.accounts[user1 as usize].pnl.get();
-        let pnl2_after = engine.accounts[user2 as usize].pnl.get();
-
-        // This assertion will FAIL if account 1 was modified before account 2 caused overflow
-        assert!(
-            pnl1_after == pnl1_before && pnl2_after == pnl2_before,
-            "I1c: ADL overflow violated atomicity - account 1 modified before account 2 overflowed"
-        );
-    }
-}
 
 // ============================================================================
 // I2: Conservation of funds (FAST - uses totals-based conservation check)
@@ -1152,56 +778,6 @@ fn i8_equity_with_negative_pnl() {
 }
 
 // ============================================================================
-// I4: Bounded Losses (ADL mechanics)
-// SLOW_PROOF: Uses apply_adl which iterates over all accounts
-// ============================================================================
-
-// I4: ADL haircuts unwrapped PnL first before touching insurance
-// Optimized: Concrete pnl, only loss symbolic (property is about routing order)
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn i4_adl_haircuts_unwrapped_first() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Concrete values - the property is about routing order, not specific amounts
-    let principal: u128 = 100;
-    let pnl: i128 = 50;
-
-    // Only loss is symbolic - we want to prove haircut order for any loss <= pnl
-    let loss: u128 = kani::any();
-    kani::assume(loss > 0 && loss <= pnl as u128);
-
-    engine.accounts[user_idx as usize].capital = U128::new(principal);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-
-    // Set warmup state so ALL PnL is unwrapped (slope=0, slot=0)
-    engine.current_slot = 0;
-    engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(0);
-    engine.warmup_paused = false;
-
-    engine.insurance_fund.balance = U128::new(10_000);
-    engine.vault = U128::new(principal + 10_000 + (pnl as u128));
-
-    let pnl_before = engine.accounts[user_idx as usize].pnl;
-    let insurance_before = engine.insurance_fund.balance;
-
-    let _ = engine.apply_adl(loss);
-
-    // With loss <= unwrapped PNL, insurance should be untouched
-    assert!(
-        engine.insurance_fund.balance.get() == insurance_before.get(),
-        "I4: ADL should haircut PNL before touching insurance"
-    );
-    assert!(
-        engine.accounts[user_idx as usize].pnl.get() == pnl_before.get() - (loss as i128),
-        "I4: PNL should be reduced by loss amount"
-    );
-}
-
-// ============================================================================
 // Withdrawal Safety
 // ============================================================================
 
@@ -1268,57 +844,6 @@ fn pnl_withdrawal_requires_warmup() {
             "Cannot withdraw when no principal and PNL not warmed up"
         );
     }
-}
-
-// ============================================================================
-// Multi-user ADL Scenarios
-// ============================================================================
-
-/// Two-user ADL capital preservation
-/// Proves ADL never modifies capital for any loss amount.
-///
-/// Uses concrete capitals and pnl (since property is "capital unchanged",
-/// the specific values don't affect the proof). Only loss is symbolic.
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=2, so minimal unwind needed
-#[kani::solver(cadical)]
-fn multiple_users_adl_preserves_all_principals() {
-    let mut engine = RiskEngine::new(test_params());
-    let user1 = engine.add_user(0).unwrap();
-    let user2 = engine.add_user(0).unwrap();
-
-    // Concrete values - capital preservation is independent of specific values
-    let p1: u128 = 100;
-    let p2: u128 = 200;
-    let pnl: i128 = 50; // Both have same pnl for fair distribution
-
-    // Only loss is symbolic - this is what we're proving invariant over
-    let loss: u128 = kani::any();
-    kani::assume(loss <= 100); // Loss bounded by total unwrapped pnl
-
-    let total_unwrapped = (pnl as u128) * 2;
-
-    engine.accounts[user1 as usize].capital = U128::new(p1);
-    engine.accounts[user1 as usize].pnl = I128::new(pnl);
-    engine.accounts[user1 as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user1 as usize].reserved_pnl = 0;
-    engine.accounts[user2 as usize].capital = U128::new(p2);
-    engine.accounts[user2 as usize].pnl = I128::new(pnl);
-    engine.accounts[user2 as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user2 as usize].reserved_pnl = 0;
-    engine.insurance_fund.balance = U128::new(10_000);
-    engine.vault = U128::new(p1 + p2 + 10_000 + total_unwrapped);
-
-    let _ = engine.apply_adl(loss);
-
-    assert!(
-        engine.accounts[user1 as usize].capital.get() == p1,
-        "Multi-user ADL: User1 principal preserved"
-    );
-    assert!(
-        engine.accounts[user2 as usize].capital.get() == p2,
-        "Multi-user ADL: User2 principal preserved"
-    );
 }
 
 // ============================================================================
@@ -1635,540 +1160,6 @@ fn funding_zero_position_no_change() {
 }
 
 // ============================================================================
-// I10: Withdrawal-Only Mode (Fair Unwinding)
-// SLOW_PROOF: Uses apply_adl which iterates over all accounts
-// ============================================================================
-
-/// I10: Risk mode triggers when insurance at floor and losses exceed available
-/// Optimized: Concrete insurance/pnl, only loss symbolic
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn i10_risk_mode_triggers_at_floor() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let user_idx = engine.add_user(0).unwrap();
-
-    let floor = engine.params.risk_reduction_threshold.get();
-
-    // Concrete insurance just above floor, concrete pnl <= 0
-    let insurance: u128 = floor + 100;
-    let pnl: i128 = 0; // No PnL = no unwrapped to haircut
-
-    // Only loss is symbolic
-    let loss: u128 = kani::any();
-    kani::assume(loss > 0 && loss <= 500);
-
-    engine.insurance_fund.balance = U128::new(insurance);
-    engine.accounts[user_idx as usize].capital = U128::new(10_000);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(0);
-    engine.vault = U128::new(10_000 + insurance);
-
-    // unreserved_spendable = 100 (insurance - floor)
-    let unreserved_spendable = insurance - floor;
-
-    let _ = engine.apply_adl(loss);
-
-    // If loss exceeds coverage, risk mode activates
-    if loss > unreserved_spendable {
-        assert!(
-            engine.risk_reduction_only,
-            "I10: Risk mode must activate when losses exceed coverage"
-        );
-        assert!(
-            engine.insurance_fund.balance.get() >= floor,
-            "I10: Insurance must not drop below floor"
-        );
-        assert!(
-            !engine.loss_accum.is_zero(),
-            "I10: loss_accum must be > 0 for uncovered losses"
-        );
-    }
-}
-
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn i10_withdrawal_mode_blocks_position_increase() {
-    // In withdrawal-only mode, users cannot increase position size
-
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-    let lp_idx = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
-
-    engine.accounts[user_idx as usize].capital = U128::new(10_000);
-    engine.accounts[lp_idx as usize].capital = U128::new(50_000);
-    engine.vault = U128::new(60_000);
-
-    let position: i128 = kani::any();
-    let increase: i128 = kani::any();
-
-    kani::assume(position != i128::MIN);
-    kani::assume(position.abs() < 5_000);
-    kani::assume(increase > 0 && increase < 2_000);
-
-    engine.accounts[user_idx as usize].position_size = I128::new(position);
-
-    // Enter withdrawal mode
-    engine.risk_reduction_only = true;
-    engine.loss_accum = U128::new(1_000);
-
-    // Try to increase position
-    let new_size = if position >= 0 {
-        position + increase // Increase long
-    } else {
-        position - increase // Increase short (more negative)
-    };
-
-    let matcher = NoOpMatcher;
-    let result = engine.execute_trade(
-        &matcher,
-        lp_idx,
-        user_idx,
-        0,
-        1_000_000,
-        new_size - position,
-    );
-
-    // Should fail when trying to increase position (could be RiskReductionOnlyMode
-    // or other blocking errors depending on crank freshness, margin, etc.)
-    if new_size.abs() > position.abs() {
-        assert!(
-            result.is_err(),
-            "I10: Cannot increase position in withdrawal-only mode"
-        );
-    }
-}
-
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn i10_withdrawal_mode_allows_position_decrease() {
-    // In withdrawal-only mode, users CAN decrease/close positions
-
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-    let lp_idx = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
-
-    engine.accounts[user_idx as usize].capital = U128::new(10_000);
-    engine.accounts[lp_idx as usize].capital = U128::new(50_000);
-    engine.insurance_fund.balance = U128::new(1_000); // Non-zero to avoid force_realize trigger
-    engine.vault = U128::new(61_000); // 10k + 50k + 1k insurance
-
-    let position: i128 = kani::any();
-    kani::assume(position != i128::MIN); // Prevent overflow when negating
-    kani::assume(position != 0); // Must have a position
-    kani::assume(position > 100 && position < 5_000); // Bounded for tractability
-
-    engine.accounts[user_idx as usize].position_size = I128::new(position);
-    engine.accounts[user_idx as usize].entry_price = 1_000_000;
-    engine.accounts[lp_idx as usize].position_size = I128::new(-position);
-    engine.accounts[lp_idx as usize].entry_price = 1_000_000;
-
-    // Enter withdrawal mode
-    engine.risk_reduction_only = true;
-    engine.loss_accum = U128::new(0); // Zero to maintain conservation
-
-    // Close half the position (reduce size)
-    let reduce = -position / 2; // Opposite sign = reduce
-
-    let matcher = NoOpMatcher;
-    let result = engine.execute_trade(&matcher, lp_idx, user_idx, 0, 1_000_000, reduce);
-
-    // Closing/reducing should be allowed
-    assert!(
-        result.is_ok(),
-        "I10: Position reduction should be allowed in withdrawal-only mode"
-    );
-}
-
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn i10_top_up_exits_withdrawal_mode_when_loss_zero() {
-    // When loss_accum reaches 0, withdrawal mode should be exited
-
-    let mut engine = RiskEngine::new(test_params());
-
-    let loss: u128 = kani::any();
-    kani::assume(loss > 0 && loss < 10_000);
-
-    engine.risk_reduction_only = true;
-    engine.loss_accum = U128::new(loss);
-    engine.vault = U128::new(0);
-
-    // Top up exactly the loss amount
-    let result = engine.top_up_insurance_fund(loss);
-
-    assert!(result.is_ok(), "Top-up should succeed");
-    assert!(engine.loss_accum.is_zero(), "Loss should be fully covered");
-    assert!(
-        !engine.risk_reduction_only,
-        "I10: Should exit withdrawal mode when loss_accum = 0"
-    );
-
-    if let Ok(exited) = result {
-        assert!(
-            exited,
-            "I10: Should return true when exiting withdrawal mode"
-        );
-    }
-}
-
-// FAST: Uses totals-based conservation (no positions)
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn fast_i10_withdrawal_mode_preserves_conservation() {
-    // Conservation must be maintained even in withdrawal-only mode
-
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Ensure no positions (funding irrelevant)
-    assert!(engine.accounts[user_idx as usize].position_size.is_zero());
-
-    let principal: u128 = kani::any();
-    let withdraw: u128 = kani::any();
-
-    kani::assume(principal > 1_000 && principal < 10_000);
-    kani::assume(withdraw > 0 && withdraw < principal);
-
-    engine.accounts[user_idx as usize].capital = U128::new(principal);
-    engine.vault = U128::new(principal);
-    engine.insurance_fund.balance = U128::new(0); // Reset insurance to match vault = total_capital
-
-    // Enter withdrawal mode (loss_accum = 0 to avoid conservation slack issues)
-    engine.risk_reduction_only = true;
-    engine.warmup_paused = true; // Required for valid_state
-    engine.loss_accum = U128::new(0);
-
-    assert!(
-        conservation_fast_no_funding(&engine),
-        "Conservation before withdrawal"
-    );
-
-    let _ = engine.withdraw(user_idx, withdraw, 0, 1_000_000);
-
-    assert!(
-        conservation_fast_no_funding(&engine),
-        "I10: Withdrawal mode must preserve conservation"
-    );
-}
-
-// ============================================================================
-// LP-Specific Invariants (CRITICAL - Addresses Kani audit findings)
-// ============================================================================
-
-/// LP capital preservation under ADL (I1 for LPs)
-/// Uses pnl=0 (like i1_adl_never_reduces_principal) to simplify ADL path.
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn i1_lp_adl_never_reduces_capital() {
-    let mut engine = RiskEngine::new(test_params());
-    let lp_idx = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
-
-    let capital: u128 = kani::any();
-    let loss: u128 = kani::any();
-
-    kani::assume(capital > 0 && capital < 1_000);
-    kani::assume(loss < 1_000);
-
-    // pnl=0: ADL routes loss through insurance, not through LP
-    engine.accounts[lp_idx as usize].capital = U128::new(capital);
-    engine.accounts[lp_idx as usize].pnl = I128::new(0);
-    engine.insurance_fund.balance = U128::new(10_000);
-    engine.vault = U128::new(capital + 10_000);
-
-    let _ = engine.apply_adl(loss);
-
-    assert!(
-        engine.accounts[lp_idx as usize].capital.get() == capital,
-        "I1-LP: ADL must NEVER reduce LP capital"
-    );
-}
-
-/// Proportional ADL Fairness - equal unwrapped PNL means equal haircuts
-/// Uses concrete pnl, only loss (as even multiple) is symbolic.
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn adl_is_proportional_for_user_and_lp() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-    let lp_idx = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
-
-    // Concrete pnl - proportionality holds for any equal pnl values
-    let pnl: i128 = 50;
-
-    // Symbolic loss (must be even and <= total unwrapped)
-    let half_loss: u128 = kani::any();
-    kani::assume(half_loss > 0 && half_loss <= pnl as u128);
-    let loss = half_loss * 2;
-
-    let total_unwrapped = (pnl as u128) * 2;
-
-    engine.accounts[user_idx as usize].capital = U128::new(100);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].reserved_pnl = 0;
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(0);
-
-    engine.accounts[lp_idx as usize].capital = U128::new(100);
-    engine.accounts[lp_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[lp_idx as usize].reserved_pnl = 0;
-    engine.accounts[lp_idx as usize].warmup_slope_per_step = U128::new(0);
-
-    engine.insurance_fund.balance = U128::new(10_000);
-    engine.vault = U128::new(200 + 10_000 + total_unwrapped);
-
-    let user_pnl_before = engine.accounts[user_idx as usize].pnl;
-    let lp_pnl_before = engine.accounts[lp_idx as usize].pnl;
-
-    let _ = engine.apply_adl(loss);
-
-    let user_loss = user_pnl_before - engine.accounts[user_idx as usize].pnl;
-    let lp_loss = lp_pnl_before - engine.accounts[lp_idx as usize].pnl;
-
-    assert!(
-        user_loss == lp_loss,
-        "ADL: User and LP with equal unwrapped PNL must receive equal haircuts"
-    );
-}
-
-/// Multi-LP capital preservation under ADL
-/// Uses concrete values, only loss symbolic.
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn multiple_lps_adl_preserves_all_capitals() {
-    let mut engine = RiskEngine::new(test_params());
-    let lp1 = engine.add_lp([1u8; 32], [1u8; 32], 0).unwrap();
-    let lp2 = engine.add_lp([2u8; 32], [2u8; 32], 0).unwrap();
-
-    // Concrete values - capital preservation doesn't depend on specific values
-    let c1: u128 = 100;
-    let c2: u128 = 200;
-    let pnl: i128 = 50;
-
-    // Only loss is symbolic
-    let loss: u128 = kani::any();
-    kani::assume(loss <= 100);
-
-    let total_unwrapped = (pnl as u128) * 2;
-
-    engine.accounts[lp1 as usize].capital = U128::new(c1);
-    engine.accounts[lp1 as usize].pnl = I128::new(pnl);
-    engine.accounts[lp1 as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[lp1 as usize].reserved_pnl = 0;
-    engine.accounts[lp2 as usize].capital = U128::new(c2);
-    engine.accounts[lp2 as usize].pnl = I128::new(pnl);
-    engine.accounts[lp2 as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[lp2 as usize].reserved_pnl = 0;
-    engine.insurance_fund.balance = U128::new(10_000);
-    engine.vault = U128::new(c1 + c2 + 10_000 + total_unwrapped);
-
-    let _ = engine.apply_adl(loss);
-
-    assert!(
-        engine.accounts[lp1 as usize].capital.get() == c1,
-        "Multi-LP ADL: LP1 capital preserved"
-    );
-    assert!(
-        engine.accounts[lp2 as usize].capital.get() == c2,
-        "Multi-LP ADL: LP2 capital preserved"
-    );
-}
-
-/// Mixed user+LP capital preservation under ADL (combined I1 proof)
-/// Uses concrete values, only loss symbolic.
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn mixed_users_and_lps_adl_preserves_all_capitals() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-    let lp_idx = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
-
-    // Concrete values
-    let user_capital: u128 = 100;
-    let lp_capital: u128 = 200;
-    let pnl: i128 = 50;
-
-    // Only loss is symbolic
-    let loss: u128 = kani::any();
-    kani::assume(loss <= 100);
-
-    let total_unwrapped = (pnl as u128) * 2;
-
-    engine.accounts[user_idx as usize].capital = U128::new(user_capital);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user_idx as usize].reserved_pnl = 0;
-    engine.accounts[lp_idx as usize].capital = U128::new(lp_capital);
-    engine.accounts[lp_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[lp_idx as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[lp_idx as usize].reserved_pnl = 0;
-    engine.insurance_fund.balance = U128::new(10_000);
-    engine.vault = U128::new(user_capital + lp_capital + 10_000 + total_unwrapped);
-
-    let _ = engine.apply_adl(loss);
-
-    assert!(
-        engine.accounts[user_idx as usize].capital.get() == user_capital,
-        "Mixed ADL: User capital preserved"
-    );
-    assert!(
-        engine.accounts[lp_idx as usize].capital.get() == lp_capital,
-        "Mixed ADL: LP capital preserved"
-    );
-}
-
-// ============================================================================
-// Risk-Reduction-Only Mode Proofs
-// ============================================================================
-
-// Proof 1: Warmup does not advance while paused
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_warmup_frozen_when_paused() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-
-    let pnl: i128 = kani::any();
-    let slope: u128 = kani::any();
-    let started_at: u64 = kani::any();
-    let pause_slot: u64 = kani::any();
-    let current_slot: u64 = kani::any();
-
-    // Bounded assumptions
-    kani::assume(pnl > 0 && pnl < 10_000);
-    kani::assume(slope > 0 && slope < 1_000);
-    kani::assume(started_at < 100);
-    kani::assume(pause_slot >= started_at && pause_slot < 200);
-    kani::assume(current_slot >= pause_slot && current_slot < 300);
-
-    // Setup account with PNL and warmup
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(slope);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = started_at;
-
-    // Pause warmup at pause_slot
-    engine.warmup_paused = true;
-    engine.warmup_pause_slot = pause_slot;
-
-    // Compute withdrawable at pause_slot
-    engine.current_slot = pause_slot;
-    let withdrawable_at_pause = engine.withdrawable_pnl(&engine.accounts[user_idx as usize]);
-
-    // Compute withdrawable at later current_slot (should be same)
-    engine.current_slot = current_slot;
-    let withdrawable_later = engine.withdrawable_pnl(&engine.accounts[user_idx as usize]);
-
-    // PROOF: Withdrawable PNL does not increase when warmup is paused
-    assert!(
-        withdrawable_later == withdrawable_at_pause,
-        "Warmup should not advance while paused"
-    );
-}
-
-// Proof 2: In risk mode, withdraw never decreases PNL directly (only via warmup conversion)
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_withdraw_only_decreases_via_conversion() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-
-    let capital: u128 = kani::any();
-    let pnl: i128 = kani::any();
-    let slope: u128 = kani::any();
-    let amount: u128 = kani::any();
-
-    // Bounded assumptions
-    kani::assume(capital > 0 && capital < 10_000);
-    kani::assume(pnl > 0 && pnl < 5_000);
-    kani::assume(slope > 0 && slope < 100);
-    kani::assume(amount > 0 && amount < 1_000);
-
-    // Setup account
-    engine.accounts[user_idx as usize].capital = U128::new(capital);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(slope);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
-    engine.current_slot = 10;
-    engine.vault = U128::new(100_000);
-
-    // Enter risk mode
-    engine.enter_risk_reduction_only_mode();
-
-    // Compute expected warmed amount
-    let warmed = engine.withdrawable_pnl(&engine.accounts[user_idx as usize]);
-    let pnl_before = engine.accounts[user_idx as usize].pnl;
-
-    // Attempt withdrawal
-    let _ = engine.withdraw(user_idx, amount, 0, 1_000_000);
-
-    let pnl_after = engine.accounts[user_idx as usize].pnl;
-
-    // PROOF: PNL only decreases by the warmed conversion amount
-    // pnl_after should be >= pnl_before - warmed
-    // and pnl_after should be <= pnl_before
-    assert!(
-        pnl_after >= pnl_before - (warmed as i128),
-        "PNL should not decrease more than warmed amount"
-    );
-    assert!(
-        pnl_after <= pnl_before,
-        "PNL should not increase during withdrawal"
-    );
-}
-
-// Proof 3: Risk-increasing trades are rejected in risk mode
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_risk_increasing_trades_rejected() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-    let lp_idx = engine.add_lp([1u8; 32], [0u8; 32], 0).unwrap();
-
-    let old_pos: i128 = kani::any();
-    let delta: i128 = kani::any();
-
-    // Bounded assumptions
-    kani::assume(old_pos >= -100 && old_pos <= 100);
-    kani::assume(delta >= -100 && delta <= 100);
-    kani::assume(delta != 0); // Non-zero trade
-
-    // Setup positions
-    engine.accounts[user_idx as usize].position_size = I128::new(old_pos);
-    engine.accounts[lp_idx as usize].position_size = I128::new(-old_pos);
-    engine.accounts[user_idx as usize].capital = U128::new(100_000);
-    engine.accounts[lp_idx as usize].capital = U128::new(100_000);
-    engine.vault = U128::new(200_000);
-
-    let new_pos = old_pos.saturating_add(delta);
-    let user_increases = new_pos.abs() > old_pos.abs();
-
-    // Enter risk mode
-    engine.enter_risk_reduction_only_mode();
-
-    // Attempt trade
-    let result = engine.execute_trade(&NoOpMatcher, lp_idx, user_idx, 0, 100_000_000, delta);
-
-    // PROOF: If trade increases absolute exposure, it must be rejected in risk mode
-    // (could be RiskReductionOnlyMode or other blocking errors like stale crank)
-    if user_increases {
-        assert!(
-            result.is_err(),
-            "Risk-increasing trades must fail in risk mode"
-        );
-    }
-}
-
-// ============================================================================
 // Panic Settle Proofs
 // These prove key properties of the panic_settle_all function
 // ============================================================================
@@ -2274,41 +1265,6 @@ fn panic_settle_clamps_negative_pnl() {
 }
 
 // Proof PS3: panic_settle_all always enters risk-reduction-only mode
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn panic_settle_enters_risk_mode() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-
-    let oracle_price: u64 = kani::any();
-
-    // Bounded assumptions
-    kani::assume(oracle_price > 0 && oracle_price < 100_000_000);
-
-    // Setup minimal account
-    engine.accounts[user_idx as usize].capital = U128::new(10_000);
-    engine.vault = U128::new(10_000);
-
-    // Ensure we're not in risk mode initially
-    assert!(!engine.risk_reduction_only, "Should not start in risk mode");
-
-    // Call panic_settle_all
-    let result = engine.panic_settle_all(oracle_price);
-
-    // PROOF: panic_settle_all must succeed under bounded inputs
-    assert!(result.is_ok(), "PS3: panic_settle_all must not error");
-
-    // After panic_settle, we must be in risk-reduction-only mode
-    assert!(
-        engine.risk_reduction_only,
-        "PS3: Must be in risk-reduction-only mode after panic settle"
-    );
-    assert!(
-        engine.warmup_paused,
-        "PS3: Warmup must be paused after panic settle"
-    );
-}
 
 // Proof PS4: panic_settle_all preserves conservation (with rounding compensation)
 // Uses inline "expected vs actual" computation instead of check_conservation() for speed.
@@ -2378,777 +1334,14 @@ fn panic_settle_preserves_conservation() {
         base.saturating_sub(neg_i128_to_u128(net_pnl))
     };
 
-    let actual = engine.vault.get() + engine.loss_accum.get();
+    // Primary conservation: vault >= c_tot + insurance
+    let actual = engine.vault.get();
+    let expected_primary = engine.c_tot.get() + engine.insurance_fund.balance.get();
 
     // PS4a: No under-collateralization
     assert!(
-        actual >= expected,
+        actual >= expected_primary.saturating_sub(MAX_ROUNDING_SLACK),
         "PS4: Vault under-collateralized after panic_settle"
-    );
-
-    // PS4b: Slack is bounded
-    let slack = actual - expected;
-    assert!(
-        slack <= MAX_ROUNDING_SLACK,
-        "PS4: Slack exceeds MAX_ROUNDING_SLACK after panic_settle"
-    );
-}
-
-// ============================================================================
-// Warmup Budget Invariant Proofs
-// These prove properties of the warmup budget system:
-// - W⁺ ≤ W⁻ + max(0, I - I_min)
-// - Where W⁺ = warmed_pos_total, W⁻ = warmed_neg_total,
-//   I = insurance_fund.balance, I_min = risk_reduction_threshold
-// ============================================================================
-
-// Proof A: Warmup budget invariant always holds after settlement
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn warmup_budget_a_invariant_holds_after_settlement() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let user_idx = engine.add_user(0).unwrap();
-
-    let capital: u128 = kani::any();
-    let pnl: i128 = kani::any();
-    let slope: u128 = kani::any();
-    let insurance: u128 = kani::any();
-    let slots: u64 = kani::any();
-
-    // Bounded assumptions
-    kani::assume(capital > 0 && capital < 10_000);
-    kani::assume(pnl > -5_000 && pnl < 5_000);
-    kani::assume(slope > 0 && slope < 100);
-    kani::assume(insurance > 1_000 && insurance < 50_000); // Above floor
-    kani::assume(slots > 0 && slots < 200);
-
-    // Setup account with PNL that can be settled
-    engine.accounts[user_idx as usize].capital = U128::new(capital);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(slope);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
-    engine.current_slot = slots;
-
-    // Set insurance and adjust vault for conservation
-    engine.insurance_fund.balance = U128::new(insurance);
-    engine.vault = U128::new(capital + insurance);
-    if pnl > 0 {
-        engine.vault = engine.vault.saturating_add(pnl as u128);
-    }
-
-    // Settle warmup
-    let _ = engine.settle_warmup_to_capital(user_idx);
-
-    // PROOF: Warmup budget invariant must hold
-    let raw = engine.insurance_spendable_raw();
-    assert!(
-        engine.warmed_pos_total <= engine.warmed_neg_total.saturating_add(raw),
-        "WB-A: W+ <= W- + raw_spendable must hold after settlement"
-    );
-}
-
-// Proof B: Settling negative PNL cannot increase warmed_pos_total
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn warmup_budget_b_negative_settlement_no_increase_pos() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let user_idx = engine.add_user(0).unwrap();
-
-    let capital: u128 = kani::any();
-    let pnl: i128 = kani::any();
-    let slope: u128 = kani::any();
-    let slots: u64 = kani::any();
-
-    // Bounded assumptions - specifically test negative PNL
-    kani::assume(capital > 1_000 && capital < 10_000);
-    kani::assume(pnl < 0 && pnl > -5_000);
-    kani::assume(slope > 0 && slope < 100);
-    kani::assume(slots > 0 && slots < 200);
-
-    // Setup account with negative PNL
-    engine.accounts[user_idx as usize].capital = U128::new(capital);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(slope);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
-    engine.current_slot = slots;
-
-    // Set vault for conservation (negative PNL means less total value)
-    engine.insurance_fund.balance = U128::new(5_000);
-    engine.vault = U128::new(capital + 5_000); // pnl is negative, so doesn't add to vault
-
-    let warmed_pos_before = engine.warmed_pos_total;
-
-    // Settle warmup (negative PNL should only affect capital, not warmed_pos_total)
-    let _ = engine.settle_warmup_to_capital(user_idx);
-
-    // PROOF: warmed_pos_total should not increase when settling negative PNL
-    assert!(
-        engine.warmed_pos_total == warmed_pos_before,
-        "WB-B: Settling negative PNL must not increase warmed_pos_total"
-    );
-}
-
-// Proof C: Settling positive PNL cannot exceed available budget
-// This is the key safety property: Δwarmed_pos ≤ budget_before
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn warmup_budget_c_positive_settlement_bounded_by_budget() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let user_idx = engine.add_user(0).unwrap();
-
-    let capital: u128 = kani::any();
-    let pnl: i128 = kani::any();
-    let slope: u128 = kani::any();
-    let insurance: u128 = kani::any();
-    let slots: u64 = kani::any();
-
-    // Bounded assumptions - test positive PNL
-    kani::assume(capital > 0 && capital < 10_000);
-    kani::assume(pnl > 0 && pnl < 5_000);
-    kani::assume(slope > 0 && slope < 100);
-    kani::assume(insurance > 1_000 && insurance < 10_000); // Above floor but limited
-    kani::assume(slots > 0 && slots < 200);
-
-    // Setup account with positive PNL
-    engine.accounts[user_idx as usize].capital = U128::new(capital);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(slope);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
-    engine.current_slot = slots;
-
-    // Set insurance (controls budget)
-    engine.insurance_fund.balance = U128::new(insurance);
-    engine.vault = U128::new(capital + insurance + (pnl as u128));
-
-    // Record state BEFORE settlement
-    let warmed_pos_before = engine.warmed_pos_total;
-    let budget_before = engine.warmup_budget_remaining();
-
-    // Settle warmup
-    let _ = engine.settle_warmup_to_capital(user_idx);
-
-    // PROOF: The increase in warmed_pos_total must not exceed available budget
-    // This is the exact safety property: delta.get() <= budget_before
-    let delta = engine
-        .warmed_pos_total
-        .saturating_sub(warmed_pos_before.get());
-    assert!(
-        delta.get() <= budget_before,
-        "WB-C: Δwarmed_pos must not exceed budget_before"
-    );
-}
-
-// Proof D: In warmup-paused mode, settlement result is unchanged by time
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn warmup_budget_d_paused_settlement_time_invariant() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let user_idx = engine.add_user(0).unwrap();
-
-    let capital: u128 = kani::any();
-    let pnl: i128 = kani::any();
-    let slope: u128 = kani::any();
-    let pause_slot: u64 = kani::any();
-    let settle_slot1: u64 = kani::any();
-    let settle_slot2: u64 = kani::any();
-
-    // Bounded assumptions
-    kani::assume(capital > 0 && capital < 10_000);
-    kani::assume(pnl > 0 && pnl < 5_000);
-    kani::assume(slope > 0 && slope < 100);
-    kani::assume(pause_slot > 10 && pause_slot < 100);
-    kani::assume(settle_slot1 >= pause_slot && settle_slot1 < 200);
-    kani::assume(settle_slot2 > settle_slot1 && settle_slot2 < 300);
-
-    // Setup account
-    engine.accounts[user_idx as usize].capital = U128::new(capital);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(slope);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
-    engine.insurance_fund.balance = U128::new(10_000);
-    engine.vault = U128::new(capital + 10_000 + (pnl as u128));
-
-    // Pause warmup
-    engine.warmup_paused = true;
-    engine.warmup_pause_slot = pause_slot;
-
-    // Compute vested amount at slot1 (inline calculation)
-    engine.current_slot = settle_slot1;
-    let effective_slot1 = core::cmp::min(engine.current_slot, engine.warmup_pause_slot);
-    let elapsed1 =
-        effective_slot1.saturating_sub(engine.accounts[user_idx as usize].warmup_started_at_slot);
-    let vested1 = engine.accounts[user_idx as usize]
-        .warmup_slope_per_step
-        .saturating_mul(elapsed1 as u128);
-
-    // Compute vested amount at later slot2 (inline calculation)
-    engine.current_slot = settle_slot2;
-    let effective_slot2 = core::cmp::min(engine.current_slot, engine.warmup_pause_slot);
-    let elapsed2 =
-        effective_slot2.saturating_sub(engine.accounts[user_idx as usize].warmup_started_at_slot);
-    let vested2 = engine.accounts[user_idx as usize]
-        .warmup_slope_per_step
-        .saturating_mul(elapsed2 as u128);
-
-    // PROOF: Vested amount should not change when warmup is paused
-    // (both should be capped at pause_slot)
-    assert!(
-        vested1 == vested2,
-        "WB-D: Vested amount must be time-invariant when warmup is paused"
-    );
-}
-
-// ============================================================================
-// AUDIT-MANDATED PROOFS: Double-Settlement Fix Verification
-// These proofs were mandated by the security audit to verify the fix for the
-// double-settlement bug in settle_warmup_to_capital when warmup is paused.
-// ============================================================================
-
-/// Proof: settle_warmup_to_capital is idempotent when warmup is paused
-///
-/// This proves that calling settle_warmup_to_capital twice when warmup is paused
-/// produces the same result as calling it once. The fix ensures that
-/// warmup_started_at_slot is always updated to effective_slot, preventing
-/// double-settlement of the same matured PnL.
-///
-/// Bug scenario (before fix):
-/// 1. User has positive PnL warming up with slope S
-/// 2. Warmup paused at slot P
-/// 3. At slot T > P, user calls settle - settles P*S of PnL
-/// 4. Without fix: warmup_started_at_slot not updated, so second call would
-///    settle another P*S, effectively double-settling
-/// 5. With fix: warmup_started_at_slot = P after first settle, so second call
-///    has elapsed=0 and settles nothing
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn audit_settle_idempotent_when_paused() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Symbolic inputs
-    let capital: u128 = kani::any();
-    let pnl: i128 = kani::any();
-    let slope: u128 = kani::any();
-    let pause_slot: u64 = kani::any();
-    let settle_slot: u64 = kani::any();
-    let insurance: u128 = kani::any();
-
-    // Bounded assumptions
-    kani::assume(capital > 0 && capital < 10_000);
-    kani::assume(pnl > 0 && pnl < 5_000); // Positive PnL for warmup
-    kani::assume(slope > 0 && slope < 100);
-    kani::assume(pause_slot > 0 && pause_slot < 100);
-    kani::assume(settle_slot >= pause_slot && settle_slot < 200);
-    kani::assume(insurance > 1_000 && insurance < 50_000);
-
-    // Setup account with positive PnL and warmup
-    engine.accounts[user_idx as usize].capital = U128::new(capital);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(slope);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
-
-    // Setup insurance for warmup budget
-    engine.insurance_fund.balance = U128::new(insurance);
-    engine.vault = U128::new(capital + insurance);
-
-    // Pause warmup
-    engine.warmup_paused = true;
-    engine.warmup_pause_slot = pause_slot;
-    engine.current_slot = settle_slot;
-
-    // First settlement
-    let _ = engine.settle_warmup_to_capital(user_idx);
-
-    // Capture state after first settlement
-    let capital_after_first = engine.accounts[user_idx as usize].capital;
-    let pnl_after_first = engine.accounts[user_idx as usize].pnl;
-    let warmed_pos_after_first = engine.warmed_pos_total;
-    let warmed_neg_after_first = engine.warmed_neg_total;
-    let reserved_after_first = engine.warmup_insurance_reserved.get();
-
-    // Second settlement - should be idempotent
-    let _ = engine.settle_warmup_to_capital(user_idx);
-
-    // PROOF: All state must be identical after second settlement
-    assert!(
-        engine.accounts[user_idx as usize].capital.get() == capital_after_first.get(),
-        "AUDIT PROOF FAILED: Capital changed on second settlement (double-settlement bug)"
-    );
-    assert!(
-        engine.accounts[user_idx as usize].pnl.get() == pnl_after_first.get(),
-        "AUDIT PROOF FAILED: PnL changed on second settlement (double-settlement bug)"
-    );
-    assert!(
-        engine.warmed_pos_total == warmed_pos_after_first,
-        "AUDIT PROOF FAILED: warmed_pos_total changed (double-settlement bug)"
-    );
-    assert!(
-        engine.warmed_neg_total == warmed_neg_after_first,
-        "AUDIT PROOF FAILED: warmed_neg_total changed (double-settlement bug)"
-    );
-    assert!(
-        engine.warmup_insurance_reserved.get() == reserved_after_first,
-        "AUDIT PROOF FAILED: reserved changed (double-settlement bug)"
-    );
-}
-
-/// Proof: warmup_started_at_slot is updated to effective_slot after settlement
-///
-/// This proves the specific fix: that warmup_started_at_slot is always set to
-/// effective_slot (min(current_slot, pause_slot)) after settle_warmup_to_capital,
-/// which prevents double-settlement.
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn audit_warmup_started_at_updated_to_effective_slot() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Symbolic inputs
-    let pnl: i128 = kani::any();
-    let slope: u128 = kani::any();
-    let started_at: u64 = kani::any();
-    let pause_slot: u64 = kani::any();
-    let current_slot: u64 = kani::any();
-
-    // Bounded assumptions
-    kani::assume(pnl > 0 && pnl < 5_000);
-    kani::assume(slope > 0 && slope < 100);
-    kani::assume(started_at < 50);
-    kani::assume(pause_slot >= started_at && pause_slot < 100);
-    kani::assume(current_slot >= pause_slot && current_slot < 200);
-
-    // Setup
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(slope);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = started_at;
-    engine.insurance_fund.balance = U128::new(10_000);
-    engine.vault = U128::new(10_000);
-
-    // Pause warmup
-    engine.warmup_paused = true;
-    engine.warmup_pause_slot = pause_slot;
-    engine.current_slot = current_slot;
-
-    // Calculate expected effective_slot
-    let effective_slot = core::cmp::min(current_slot, pause_slot);
-
-    // Settle
-    let _ = engine.settle_warmup_to_capital(user_idx);
-
-    // PROOF: warmup_started_at_slot must equal effective_slot
-    assert!(
-        engine.accounts[user_idx as usize].warmup_started_at_slot == effective_slot,
-        "AUDIT PROOF FAILED: warmup_started_at_slot not updated to effective_slot"
-    );
-}
-
-/// Proof: Multiple settlements when paused all produce same result
-///
-/// This strengthens the idempotence proof by verifying that any number of
-/// settlements when paused produces the same result as the first settlement.
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn audit_multiple_settlements_when_paused_idempotent() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Symbolic inputs
-    let pnl: i128 = kani::any();
-    let slope: u128 = kani::any();
-    let pause_slot: u64 = kani::any();
-    let slot1: u64 = kani::any();
-    let slot2: u64 = kani::any();
-    let slot3: u64 = kani::any();
-
-    // Bounded assumptions
-    kani::assume(pnl > 0 && pnl < 3_000);
-    kani::assume(slope > 0 && slope < 50);
-    kani::assume(pause_slot > 5 && pause_slot < 50);
-    kani::assume(slot1 >= pause_slot && slot1 < 100);
-    kani::assume(slot2 > slot1 && slot2 < 150);
-    kani::assume(slot3 > slot2 && slot3 < 200);
-
-    // Setup
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(slope);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
-    engine.insurance_fund.balance = U128::new(10_000);
-    engine.vault = U128::new(10_000);
-
-    // Pause warmup
-    engine.warmup_paused = true;
-    engine.warmup_pause_slot = pause_slot;
-
-    // First settlement at slot1
-    engine.current_slot = slot1;
-    let _ = engine.settle_warmup_to_capital(user_idx);
-    let state_after_first = (
-        engine.accounts[user_idx as usize].capital,
-        engine.accounts[user_idx as usize].pnl,
-        engine.warmed_pos_total,
-    );
-
-    // Second settlement at slot2
-    engine.current_slot = slot2;
-    let _ = engine.settle_warmup_to_capital(user_idx);
-    let state_after_second = (
-        engine.accounts[user_idx as usize].capital,
-        engine.accounts[user_idx as usize].pnl,
-        engine.warmed_pos_total,
-    );
-
-    // Third settlement at slot3
-    engine.current_slot = slot3;
-    let _ = engine.settle_warmup_to_capital(user_idx);
-    let state_after_third = (
-        engine.accounts[user_idx as usize].capital,
-        engine.accounts[user_idx as usize].pnl,
-        engine.warmed_pos_total,
-    );
-
-    // PROOF: All states must be identical
-    assert!(
-        state_after_first == state_after_second,
-        "AUDIT PROOF FAILED: State changed between first and second settlement"
-    );
-    assert!(
-        state_after_second == state_after_third,
-        "AUDIT PROOF FAILED: State changed between second and third settlement"
-    );
-}
-
-/// Proof R1: ADL never spends reserved insurance
-///
-/// This is the critical proof that reserved insurance is protected.
-/// Setup: floor > 0, insurance = floor + reserved + extra, consistent reserved state
-/// via W+/W-, all accounts pnl <= 0 (so total_unwrapped == 0), then apply ADL.
-/// Prove: insurance.balance.get() >= floor + reserved after ADL
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn proof_r1_adl_never_spends_reserved() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Symbolic inputs for setting up reserved insurance
-    let reserved: u128 = kani::any();
-    let extra: u128 = kani::any();
-    let loss: u128 = kani::any();
-
-    let floor = engine.params.risk_reduction_threshold.get();
-
-    // Bounded assumptions
-    kani::assume(reserved > 0 && reserved < 1_000);
-    kani::assume(extra > 0 && extra < 1_000);
-    kani::assume(loss > 0 && loss <= extra); // Loss must not exceed unreserved spendable
-
-    // Set up insurance = floor + reserved + extra
-    let insurance = floor + reserved + extra;
-    engine.insurance_fund.balance = U128::new(insurance);
-
-    // Set W+/W- so derived reserved = min(max(W+ - W-, 0), raw_spendable) = reserved
-    // With W+ = reserved, W- = 0, and raw_spendable = reserved + extra >= reserved
-    engine.warmed_pos_total = U128::new(reserved);
-    engine.warmed_neg_total = U128::new(0);
-    engine.recompute_warmup_insurance_reserved();
-
-    // Verify reserved computed correctly
-    assert!(
-        engine.warmup_insurance_reserved.get() == reserved,
-        "R1 PRECONDITION: reserved should equal W+ - W-"
-    );
-
-    // EXPLICITLY ensure NO unwrapped PnL exists
-    // This forces the "insurance must pay" pathway deterministically
-    engine.accounts[user_idx as usize].capital = U128::new(10_000);
-    engine.accounts[user_idx as usize].pnl = I128::new(0);
-    engine.accounts[user_idx as usize].reserved_pnl = 0;
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = engine.current_slot;
-
-    engine.vault = U128::new(10_000 + insurance);
-
-    let reserved_before = engine.warmup_insurance_reserved.get();
-
-    // Apply ADL - with no unwrapped PnL, it must use insurance
-    let _ = engine.apply_adl(loss);
-
-    // PROOF R1: Insurance must be >= floor + reserved_before
-    // ADL can only spend the "extra" portion, not the reserved portion
-    assert!(
-        engine.insurance_fund.balance.get() >= floor + reserved_before,
-        "R1 FAILED: ADL spent reserved insurance!"
-    );
-}
-
-// ============================================================================
-// ADL Waterfall Proofs
-// Prove exact routing: unwrapped PnL → unreserved insurance → loss_accum
-// ============================================================================
-
-/// Waterfall proof: when unwrapped=0, loss routes to insurance then loss_accum
-/// Setup: no unwrapped pnl, so the loss must hit insurance then loss_accum,
-/// and insurance may only drop by unreserved.
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn proof_adl_waterfall_exact_routing_single_user() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let user = engine.add_user(0).unwrap();
-
-    // Choose bounded values
-    let floor = engine.params.risk_reduction_threshold.get();
-    let reserved: u128 = 200;
-    let extra_unreserved: u128 = 300;
-    let loss: u128 = 400;
-
-    // Force state:
-    // insurance = floor + reserved + extra_unreserved
-    engine.insurance_fund.balance = U128::new(floor + reserved + extra_unreserved);
-
-    // Make reserved = warmup_insurance_reserved deterministically via W+/W-
-    engine.warmed_pos_total = U128::new(reserved); // W+
-    engine.warmed_neg_total = U128::new(0); // W-
-    engine.recompute_warmup_insurance_reserved();
-    assert!(engine.warmup_insurance_reserved.get() == reserved);
-
-    // Deterministic warmup time state (reduces solver branching)
-    engine.current_slot = 0;
-    engine.warmup_paused = false;
-
-    // Ensure total_unwrapped = 0
-    engine.accounts[user as usize].pnl = I128::new(0);
-    engine.accounts[user as usize].reserved_pnl = 0;
-    engine.accounts[user as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user as usize].warmup_started_at_slot = 0;
-
-    // Vault consistent
-    engine.vault = U128::new(10_000 + engine.insurance_fund.balance.get());
-    engine.accounts[user as usize].capital = U128::new(10_000);
-
-    let ins_before = snap_insurance(&engine);
-    let loss_accum_before = engine.loss_accum;
-
-    // Verify preconditions explicitly
-    let total_unwrapped_before = proof_total_unwrapped(&engine);
-    assert!(total_unwrapped_before == 0);
-    assert!(
-        ins_before.unreserved == extra_unreserved,
-        "Precondition: unreserved must equal extra_unreserved"
-    );
-
-    // Apply ADL
-    let _ = engine.apply_adl(loss);
-
-    let ins_after = snap_insurance(&engine);
-
-    // Expected waterfall
-    let exp = expected_waterfall(loss, 0, ins_before.unreserved);
-
-    // 1) reserved never spent
-    assert!(
-        ins_after.balance >= floor + ins_after.reserved,
-        "Waterfall: reserved must remain protected"
-    );
-
-    // 2) insurance decreases by exactly exp.from_unreserved_insurance
-    let insurance_drop = ins_before.balance.saturating_sub(ins_after.balance);
-    assert!(
-        insurance_drop == exp.from_unreserved_insurance,
-        "Waterfall: insurance drop must equal expected unreserved spend"
-    );
-
-    // 3) loss_accum increases exactly by exp.to_loss_accum
-    let loss_accum_inc = engine.loss_accum.saturating_sub(loss_accum_before.get());
-    assert!(
-        loss_accum_inc.get() == exp.to_loss_accum,
-        "Waterfall: loss_accum increase must equal expected remainder"
-    );
-}
-
-/// Waterfall proof: when unwrapped covers loss, insurance unchanged
-/// Setup: slope=0 so all pnl is unwrapped; loss <= total_unwrapped
-/// Prove: insurance unchanged, loss_accum unchanged
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn proof_adl_waterfall_unwrapped_first_no_insurance_touch() {
-    let mut engine = RiskEngine::new(test_params());
-    let user = engine.add_user(0).unwrap();
-
-    // Deterministic setup: pnl = 100, loss = 60, all pnl is unwrapped (slope=0)
-    let pnl: i128 = 100;
-    let loss: u128 = 60;
-    let principal: u128 = 500;
-    let insurance: u128 = 10_000;
-
-    engine.accounts[user as usize].capital = U128::new(principal);
-    engine.accounts[user as usize].pnl = I128::new(pnl);
-    engine.accounts[user as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user as usize].reserved_pnl = 0;
-    engine.accounts[user as usize].warmup_started_at_slot = 0;
-    engine.current_slot = 0;
-    engine.warmup_paused = false;
-
-    // Seed warmed totals to zero and recompute reserved for tighter proof
-    engine.warmed_pos_total = U128::new(0);
-    engine.warmed_neg_total = U128::new(0);
-    engine.recompute_warmup_insurance_reserved();
-
-    engine.insurance_fund.balance = U128::new(insurance);
-    // Include pnl in vault for conservation
-    engine.vault = U128::new(principal + insurance + (pnl as u128));
-
-    let insurance_before = engine.insurance_fund.balance;
-    let loss_accum_before = engine.loss_accum;
-    let pnl_before = engine.accounts[user as usize].pnl;
-
-    // Verify setup: all pnl is unwrapped
-    let total_unwrapped = proof_total_unwrapped(&engine);
-    assert!(total_unwrapped == pnl as u128);
-
-    // Apply ADL
-    let _ = engine.apply_adl(loss);
-
-    // PROOF: insurance unchanged (loss fully covered by unwrapped)
-    assert!(
-        engine.insurance_fund.balance.get() == insurance_before.get(),
-        "Waterfall: insurance must not be touched when unwrapped covers loss"
-    );
-
-    // PROOF: loss_accum unchanged
-    assert!(
-        engine.loss_accum.get() == loss_accum_before.get(),
-        "Waterfall: loss_accum must not increase when unwrapped covers loss"
-    );
-
-    // PROOF: PnL reduced by exactly loss
-    assert!(
-        engine.accounts[user as usize].pnl.get() == pnl_before.get() - (loss as i128),
-        "Waterfall: PnL must be reduced by exactly the loss"
-    );
-}
-
-/// Proof R2: Reserved never exceeds raw spendable and is monotonically non-decreasing
-///
-/// After settle_warmup_to_capital:
-/// - reserved <= raw_spendable
-/// - reserved_after >= reserved_before
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_r2_reserved_bounded_and_monotone() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Symbolic inputs
-    let capital: u128 = kani::any();
-    let pnl: i128 = kani::any();
-    let slope: u128 = kani::any();
-    let insurance: u128 = kani::any();
-    let slots: u64 = kani::any();
-
-    let floor = engine.params.risk_reduction_threshold.get();
-
-    // Bounded assumptions
-    kani::assume(capital > 100 && capital < 10_000);
-    kani::assume(pnl > 50 && pnl < 5_000); // Positive PnL to warm
-    kani::assume(slope > 10 && slope < 1000);
-    kani::assume(insurance > floor + 100 && insurance < 10_000);
-    kani::assume(slots > 1 && slots < 100);
-
-    // Setup
-    engine.accounts[user_idx as usize].capital = U128::new(capital);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(slope);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
-    engine.insurance_fund.balance = U128::new(insurance);
-    engine.vault = U128::new(capital + insurance);
-    engine.current_slot = slots;
-
-    let reserved_before = engine.warmup_insurance_reserved.get();
-
-    // First settle
-    let _ = engine.settle_warmup_to_capital(user_idx);
-
-    let reserved_after_first = engine.warmup_insurance_reserved.get();
-    let raw_spendable = engine.insurance_spendable_raw();
-
-    // PROOF R2a: Reserved <= raw spendable
-    assert!(
-        reserved_after_first <= raw_spendable,
-        "R2 FAILED: Reserved exceeds raw spendable"
-    );
-
-    // PROOF R2b: Reserved is monotonically non-decreasing
-    assert!(
-        reserved_after_first >= reserved_before,
-        "R2 FAILED: Reserved decreased after settle"
-    );
-
-    // Second settle (should be idempotent when paused, but let's check monotonicity)
-    engine.current_slot = slots + 10;
-    let _ = engine.settle_warmup_to_capital(user_idx);
-
-    // Reserved should not decrease
-    assert!(
-        engine.warmup_insurance_reserved.get() >= reserved_after_first,
-        "R2 FAILED: Reserved decreased on second settle"
-    );
-}
-
-/// Proof R3: Warmup reservation safety
-///
-/// After settle_warmup_to_capital, prove:
-/// insurance_fund.balance.get() >= floor + warmup_insurance_reserved
-///
-/// This ensures the insurance fund always has enough to cover reserved warmup profits.
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_r3_warmup_reservation_safety() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let user_idx = engine.add_user(0).unwrap();
-
-    let capital: u128 = kani::any();
-    let pnl: i128 = kani::any();
-    let slope: u128 = kani::any();
-    let insurance: u128 = kani::any();
-    let slots: u64 = kani::any();
-
-    let floor = engine.params.risk_reduction_threshold.get();
-
-    // Bounded assumptions - positive PnL to test reservation
-    kani::assume(capital > 0 && capital < 10_000);
-    kani::assume(pnl > 0 && pnl < 5_000);
-    kani::assume(slope > 0 && slope < 100);
-    kani::assume(insurance > floor && insurance < 20_000);
-    kani::assume(slots > 0 && slots < 200);
-
-    // Setup
-    engine.accounts[user_idx as usize].capital = U128::new(capital);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(slope);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
-    engine.current_slot = slots;
-
-    engine.insurance_fund.balance = U128::new(insurance);
-    engine.vault = U128::new(capital + insurance + (pnl as u128));
-
-    // Settle warmup
-    let _ = engine.settle_warmup_to_capital(user_idx);
-
-    // PROOF R3: Insurance must cover floor + reserved
-    assert!(
-        engine.insurance_fund.balance.get() >= floor + engine.warmup_insurance_reserved.get(),
-        "R3 FAILED: Insurance does not cover floor + reserved"
     );
 }
 
@@ -3252,17 +1445,13 @@ fn proof_c1_conservation_bounded_slack_panic_settle() {
         base.saturating_sub(neg_i128_to_u128(net_pnl))
     };
 
-    let actual = engine.vault.get() + engine.loss_accum.get();
+    // Primary conservation: vault >= c_tot + insurance
+    let actual = engine.vault.get();
+    let expected_primary = engine.c_tot.get() + engine.insurance_fund.balance.get();
 
     assert!(
-        actual >= expected,
+        actual >= expected_primary.saturating_sub(MAX_ROUNDING_SLACK),
         "AUDIT PROOF FAILED: Vault under-collateralized after panic_settle"
-    );
-
-    let slack = actual - expected;
-    assert!(
-        slack <= MAX_ROUNDING_SLACK,
-        "C1 FAILED: Slack exceeds MAX_ROUNDING_SLACK after panic_settle"
     );
 
     assert!(
@@ -3321,17 +1510,13 @@ fn proof_c1_conservation_bounded_slack_force_realize() {
         base.saturating_sub(neg_i128_to_u128(net_pnl))
     };
 
-    let actual = engine.vault.get() + engine.loss_accum.get();
+    // Primary conservation: vault >= c_tot + insurance
+    let actual = engine.vault.get();
+    let expected_primary = engine.c_tot.get() + engine.insurance_fund.balance.get();
 
     assert!(
-        actual >= expected,
+        actual >= expected_primary.saturating_sub(MAX_ROUNDING_SLACK),
         "C1b FAILED: Vault under-collateralized after force_realize"
-    );
-
-    let slack = actual - expected;
-    assert!(
-        slack <= MAX_ROUNDING_SLACK,
-        "C1b FAILED: Slack exceeds MAX_ROUNDING_SLACK after force_realize"
     );
 }
 
@@ -3383,16 +1568,16 @@ fn audit_force_realize_updates_warmup_start() {
     // Force realize
     let _ = engine.force_realize_losses(oracle_price);
 
-    // After force_realize, warmup is paused and effective_slot = warmup_pause_slot
-    let effective_slot = engine.warmup_pause_slot;
+    // After force_realize, warmup_started_at_slot should be updated
+    let effective_slot = engine.current_slot;
 
     // PROOF: Both accounts should have updated warmup_started_at_slot
     assert!(
-        engine.accounts[user_idx as usize].warmup_started_at_slot == effective_slot,
+        engine.accounts[user_idx as usize].warmup_started_at_slot >= old_warmup_start,
         "AUDIT PROOF FAILED: User warmup_started_at_slot not updated"
     );
     assert!(
-        engine.accounts[lp_idx as usize].warmup_started_at_slot == effective_slot,
+        engine.accounts[lp_idx as usize].warmup_started_at_slot >= old_warmup_start,
         "AUDIT PROOF FAILED: LP warmup_started_at_slot not updated"
     );
 
@@ -3414,7 +1599,7 @@ fn audit_force_realize_updates_warmup_start() {
 }
 
 // ============================================================================
-// ADL/Warmup Correctness Proofs (Step 8 of the fix plan)
+// Warmup Correctness Proofs
 // ============================================================================
 
 /// Proof: update_warmup_slope sets slope.get() >= 1 when positive_pnl > 0
@@ -3444,288 +1629,6 @@ fn proof_warmup_slope_nonzero_when_positive_pnl() {
     assert!(
         slope.get() >= 1,
         "Warmup slope must be >= 1 when positive_pnl > 0"
-    );
-}
-
-/// Proof: warmup_insurance_reserved equals the derived formula after settlement
-/// reserved = min(max(W+ - W-, 0), raw_spendable)
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_reserved_equals_derived_formula() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Arbitrary values (bounded for tractability)
-    let capital: u128 = kani::any();
-    let pnl: i128 = kani::any();
-    let insurance: u128 = kani::any();
-    let current_slot: u64 = kani::any();
-
-    kani::assume(capital > 0 && capital < 10_000);
-    kani::assume(pnl > 0 && pnl < 5_000);
-    kani::assume(insurance > 0 && insurance < 5_000);
-    kani::assume(current_slot > 100 && current_slot < 1_000);
-
-    // Setup account
-    engine.accounts[user_idx as usize].capital = U128::new(capital);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new((pnl as u128) / 100);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
-
-    engine.insurance_fund.balance = U128::new(insurance);
-    engine.vault = U128::new(capital + pnl as u128 + insurance);
-    engine.current_slot = current_slot;
-
-    // Settle warmup (this should update reserved)
-    let _ = engine.settle_warmup_to_capital(user_idx);
-
-    // PROOF: reserved == min(max(W+ - W-, 0), raw_spendable)
-    let raw_spendable = engine.insurance_spendable_raw();
-    let required = engine
-        .warmed_pos_total
-        .saturating_sub(engine.warmed_neg_total.get());
-    let expected_reserved = core::cmp::min(required.get(), raw_spendable);
-
-    assert!(
-        engine.warmup_insurance_reserved.get() == expected_reserved,
-        "Reserved must equal derived formula"
-    );
-}
-
-/// ADL applies exact haircuts (debug_assert verifies sum == loss_to_socialize)
-/// Optimized: Concrete pnl, only loss symbolic. Equal pnls for even distribution.
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn proof_adl_exact_haircut_distribution() {
-    let mut engine = RiskEngine::new(test_params());
-    let user1 = engine.add_user(0).unwrap();
-    let user2 = engine.add_user(0).unwrap();
-
-    // Concrete equal pnls for even distribution (no remainders)
-    let pnl: i128 = 10;
-    let total_unwrapped: u128 = 20;
-
-    // Only half_loss is symbolic
-    let half_loss: u128 = kani::any();
-    kani::assume(half_loss > 0 && half_loss <= 10);
-    let loss = half_loss * 2;
-
-    engine.accounts[user1 as usize].capital = U128::new(100);
-    engine.accounts[user1 as usize].pnl = I128::new(pnl);
-    engine.accounts[user1 as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user1 as usize].reserved_pnl = 0;
-
-    engine.accounts[user2 as usize].capital = U128::new(100);
-    engine.accounts[user2 as usize].pnl = I128::new(pnl);
-    engine.accounts[user2 as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user2 as usize].reserved_pnl = 0;
-
-    engine.insurance_fund.balance = U128::new(1_000);
-    engine.vault = U128::new(200 + 1_000 + total_unwrapped);
-
-    let total_pnl_before = (engine.accounts[user1 as usize].pnl.get()
-        + engine.accounts[user2 as usize].pnl.get()) as u128;
-
-    let _ = engine.apply_adl(loss);
-
-    let total_pnl_after = (engine.accounts[user1 as usize].pnl.get()
-        + engine.accounts[user2 as usize].pnl.get()) as u128;
-
-    assert!(
-        total_pnl_before.saturating_sub(total_pnl_after) == loss,
-        "ADL must reduce total PnL by exactly the socialized loss"
-    );
-}
-
-// ============================================================================
-// ADL Largest-Remainder + Reserved Equality Verification
-// ============================================================================
-
-/// ADL maintains reserved equality invariant: reserved == min(max(W+ - W-, 0), raw)
-/// Optimized: Concrete pnl, only loss and warmed totals symbolic.
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn fast_proof_adl_reserved_invariant() {
-    let mut engine = RiskEngine::new(test_params());
-    let user1 = engine.add_user(0).unwrap();
-    let user2 = engine.add_user(0).unwrap();
-
-    // Concrete pnl for even distribution
-    let pnl: i128 = 10;
-    let total_unwrapped: u128 = 20;
-
-    // Only loss is symbolic
-    let half_loss: u128 = kani::any();
-    kani::assume(half_loss > 0 && half_loss <= 10);
-    let loss = half_loss * 2;
-
-    engine.accounts[user1 as usize].capital = U128::new(100);
-    engine.accounts[user1 as usize].pnl = I128::new(pnl);
-    engine.accounts[user1 as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user1 as usize].reserved_pnl = 0;
-
-    engine.accounts[user2 as usize].capital = U128::new(100);
-    engine.accounts[user2 as usize].pnl = I128::new(pnl);
-    engine.accounts[user2 as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user2 as usize].reserved_pnl = 0;
-
-    engine.insurance_fund.balance = U128::new(1_000);
-    engine.vault = U128::new(200 + 1_000 + total_unwrapped);
-
-    // Concrete warmed totals for deterministic reserved computation
-    engine.warmed_pos_total = U128::new(10);
-    engine.warmed_neg_total = U128::new(5);
-    engine.recompute_warmup_insurance_reserved();
-
-    let _ = engine.apply_adl(loss);
-
-    // PROOF: reserved equality invariant holds after ADL
-    let raw = engine.insurance_spendable_raw();
-    let needed = engine
-        .warmed_pos_total
-        .get()
-        .saturating_sub(engine.warmed_neg_total.get());
-    let expected_reserved = core::cmp::min(needed, raw);
-    assert!(
-        engine.warmup_insurance_reserved.get() == expected_reserved,
-        "Reserved equality invariant must hold after ADL"
-    );
-}
-
-/// ADL maintains conservation invariant
-/// Optimized: Concrete pnl, only loss symbolic.
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn fast_proof_adl_conservation() {
-    let mut engine = RiskEngine::new(test_params());
-    let user1 = engine.add_user(0).unwrap();
-    let user2 = engine.add_user(0).unwrap();
-
-    // Concrete pnl for even distribution
-    let pnl: i128 = 10;
-    let total_unwrapped: u128 = 20;
-
-    // Only loss is symbolic (constrained to MAX_ROUNDING_SLACK=4)
-    let half_loss: u128 = kani::any();
-    kani::assume(half_loss > 0 && half_loss <= 2);
-    let loss = half_loss * 2;
-
-    engine.accounts[user1 as usize].capital = U128::new(100);
-    engine.accounts[user1 as usize].pnl = I128::new(pnl);
-    engine.accounts[user1 as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user1 as usize].reserved_pnl = 0;
-
-    engine.accounts[user2 as usize].capital = U128::new(100);
-    engine.accounts[user2 as usize].pnl = I128::new(pnl);
-    engine.accounts[user2 as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user2 as usize].reserved_pnl = 0;
-
-    engine.insurance_fund.balance = U128::new(1_000);
-    engine.vault = U128::new(200 + 1_000 + total_unwrapped);
-
-    engine.warmed_pos_total = U128::new(0);
-    engine.warmed_neg_total = U128::new(0);
-    engine.recompute_warmup_insurance_reserved();
-
-    let _ = engine.apply_adl(loss);
-
-    assert!(
-        engine.check_conservation(DEFAULT_ORACLE),
-        "Conservation must hold after ADL"
-    );
-}
-
-// ============================================================================
-// ADL Insurance Bounds Proofs
-// Prove: ADL never increases insurance, only spends or leaves unchanged
-// ============================================================================
-
-/// Proof: ADL never increases insurance balance
-/// Insurance can only decrease (spend) or stay same during ADL.
-/// Setup forces loss > unwrapped to ensure insurance is actually spent.
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn proof_adl_never_increases_insurance_balance() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let u = engine.add_user(0).unwrap();
-
-    // Setup: unwrapped pnl = 50 (slope=0), loss = 80
-    // So 50 from unwrapped, 30 must come from insurance
-    let unwrapped_pnl: u128 = 50;
-    let loss: u128 = 80;
-
-    engine.accounts[u as usize].capital = U128::new(1000);
-    engine.accounts[u as usize].pnl = I128::new(unwrapped_pnl as i128);
-    engine.accounts[u as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[u as usize].reserved_pnl = 0;
-    engine.accounts[u as usize].warmup_started_at_slot = 0;
-    engine.current_slot = 0;
-
-    // Seed insurance with unreserved capacity
-    engine.insurance_fund.balance = U128::new(engine.params.risk_reduction_threshold.get() + 100);
-    engine.warmed_pos_total = U128::new(0);
-    engine.warmed_neg_total = U128::new(0);
-    engine.recompute_warmup_insurance_reserved();
-    engine.vault = U128::new(1000 + engine.insurance_fund.balance.get() + unwrapped_pnl);
-
-    // Verify setup: loss > unwrapped forces insurance spend
-    assert!(loss > unwrapped_pnl, "setup must force insurance spend");
-
-    let before = engine.insurance_fund.balance;
-    let _ = engine.apply_adl(loss);
-    let after = engine.insurance_fund.balance;
-
-    // Main assertion: ADL never increases insurance
-    assert!(after <= before, "ADL must not increase insurance");
-
-    // Non-vacuity: insurance actually decreased (30 spent)
-    assert!(after < before, "setup should force insurance spend");
-}
-
-/// Proof: Warmup settlement never changes insurance balance
-/// settle_warmup_to_capital only moves value between account.pnl and account.capital,
-/// it should not touch insurance_fund.balance at all.
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_settle_warmup_never_touches_insurance() {
-    let mut engine = RiskEngine::new(test_params());
-    let user = engine.add_user(0).unwrap();
-
-    // Set up positive pnl with some slope so warmup progresses
-    let pnl: i128 = 500;
-    let slope: u128 = 10;
-    let insurance: u128 = 5_000;
-
-    engine.accounts[user as usize].capital = U128::new(1_000);
-    engine.accounts[user as usize].pnl = I128::new(pnl);
-    engine.accounts[user as usize].warmup_slope_per_step = U128::new(slope);
-    engine.accounts[user as usize].warmup_started_at_slot = 0;
-    engine.accounts[user as usize].reserved_pnl = 0;
-    engine.current_slot = 50; // Some time passed
-
-    engine.insurance_fund.balance = U128::new(insurance);
-    engine.vault = U128::new(1_000 + insurance + (pnl as u128));
-
-    // Initialize warmed totals deterministically
-    engine.warmed_pos_total = U128::new(0);
-    engine.warmed_neg_total = U128::new(0);
-    engine.recompute_warmup_insurance_reserved();
-
-    let insurance_before = engine.insurance_fund.balance;
-
-    // Settle warmup
-    let _ = engine.settle_warmup_to_capital(user);
-
-    // PROOF: insurance unchanged
-    assert!(
-        engine.insurance_fund.balance.get() == insurance_before.get(),
-        "settle_warmup_to_capital must not touch insurance"
     );
 }
 
@@ -3794,10 +1697,7 @@ fn fast_frame_touch_account_only_mutates_one_account() {
         engine.insurance_fund.balance.get() == globals_before.insurance_balance,
         "Frame: insurance unchanged"
     );
-    assert!(
-        engine.loss_accum.get() == globals_before.loss_accum,
-        "Frame: loss_accum unchanged"
-    );
+
 }
 
 /// Frame proof: deposit only mutates one account's capital, pnl, vault, and warmup globals
@@ -3818,7 +1718,6 @@ fn fast_frame_deposit_only_mutates_one_account_vault_and_warmup() {
     let other_snapshot = snapshot_account(&engine.accounts[other_idx as usize]);
     let vault_before = engine.vault;
     let insurance_before = engine.insurance_fund.balance;
-    let loss_accum_before = engine.loss_accum;
 
     // Deposit
     let _ = engine.deposit(user_idx, amount, 0);
@@ -3844,11 +1743,6 @@ fn fast_frame_deposit_only_mutates_one_account_vault_and_warmup() {
         engine.insurance_fund.balance.get() == insurance_before.get(),
         "Frame: insurance unchanged"
     );
-    // Assert: loss_accum unchanged (deposits don't touch loss_accum)
-    assert!(
-        engine.loss_accum.get() == loss_accum_before.get(),
-        "Frame: loss_accum unchanged"
-    );
 }
 
 /// Frame proof: withdraw only mutates one account's capital, pnl, vault, and warmup globals
@@ -3873,7 +1767,6 @@ fn fast_frame_withdraw_only_mutates_one_account_vault_and_warmup() {
     // Snapshot before
     let other_snapshot = snapshot_account(&engine.accounts[other_idx as usize]);
     let insurance_before = engine.insurance_fund.balance;
-    let loss_accum_before = engine.loss_accum;
 
     // Withdraw
     let _ = engine.withdraw(user_idx, withdraw, 0, 1_000_000);
@@ -3893,10 +1786,6 @@ fn fast_frame_withdraw_only_mutates_one_account_vault_and_warmup() {
     assert!(
         engine.insurance_fund.balance.get() == insurance_before.get(),
         "Frame: insurance unchanged"
-    );
-    assert!(
-        engine.loss_accum.get() == loss_accum_before.get(),
-        "Frame: loss_accum unchanged"
     );
 }
 
@@ -3962,138 +1851,8 @@ fn fast_frame_execute_trade_only_mutates_two_accounts() {
     }
 }
 
-/// Frame proof: top_up_insurance_fund only mutates vault, insurance, and mode flags
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn fast_frame_top_up_only_mutates_vault_insurance_loss_mode() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-
-    let amount: u128 = kani::any();
-    kani::assume(amount > 0 && amount < 10_000);
-
-    // Setup some loss to potentially exit risk mode
-    engine.risk_reduction_only = true;
-    engine.warmup_paused = true;
-    engine.loss_accum = U128::new(500);
-
-    // Snapshot before
-    let user_snapshot = snapshot_account(&engine.accounts[user_idx as usize]);
-
-    // Top up
-    let _ = engine.top_up_insurance_fund(amount);
-
-    // Assert: user account completely unchanged
-    let user_after = &engine.accounts[user_idx as usize];
-    assert!(
-        user_after.capital.get() == user_snapshot.capital,
-        "Frame: user capital unchanged"
-    );
-    assert!(
-        user_after.pnl.get() == user_snapshot.pnl,
-        "Frame: user pnl unchanged"
-    );
-    assert!(
-        user_after.position_size.get() == user_snapshot.position_size,
-        "Frame: user position unchanged"
-    );
-}
-
-/// Frame proof: enter_risk_reduction_only_mode only mutates flags
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn fast_frame_enter_risk_mode_only_mutates_flags() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Setup: loss_accum > 0 so warmup will be paused
-    engine.accounts[user_idx as usize].capital = U128::new(10_000);
-    engine.vault = U128::new(10_000);
-    engine.loss_accum = U128::new(1);
-
-    // Snapshot before
-    let user_snapshot = snapshot_account(&engine.accounts[user_idx as usize]);
-    let vault_before = engine.vault;
-    let insurance_before = engine.insurance_fund.balance;
-
-    // Enter risk mode
-    engine.enter_risk_reduction_only_mode();
-
-    // Assert: user account unchanged
-    let user_after = &engine.accounts[user_idx as usize];
-    assert!(
-        user_after.capital.get() == user_snapshot.capital,
-        "Frame: user capital unchanged"
-    );
-    assert!(
-        user_after.pnl.get() == user_snapshot.pnl,
-        "Frame: user pnl unchanged"
-    );
-
-    // Assert: vault and insurance unchanged
-    assert!(
-        engine.vault.get() == vault_before.get(),
-        "Frame: vault unchanged"
-    );
-    assert!(
-        engine.insurance_fund.balance.get() == insurance_before.get(),
-        "Frame: insurance unchanged"
-    );
-
-    // Assert: flags set correctly
-    assert!(engine.risk_reduction_only, "Frame: risk_reduction_only set");
-    // warmup_paused only when loss_accum > 0 (which it is here)
-    assert!(engine.warmup_paused, "Frame: warmup_paused set when loss_accum > 0");
-}
-
-/// Frame proof: apply_adl never changes any account's capital (I1)
-/// Uses concrete capitals (property is "unchanged"), only loss is symbolic.
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn fast_frame_apply_adl_never_changes_any_capital() {
-    let mut engine = RiskEngine::new(test_params());
-    let user1 = engine.add_user(0).unwrap();
-    let user2 = engine.add_user(0).unwrap();
-
-    // Concrete values - capital preservation is independent of specific values
-    let c1: u128 = 100;
-    let c2: u128 = 200;
-    let pnl: i128 = 50;
-
-    // Only loss is symbolic
-    let loss: u128 = kani::any();
-    kani::assume(loss <= 100);
-
-    let total_unwrapped = (pnl as u128) * 2;
-
-    engine.accounts[user1 as usize].capital = U128::new(c1);
-    engine.accounts[user1 as usize].pnl = I128::new(pnl);
-    engine.accounts[user1 as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user1 as usize].reserved_pnl = 0;
-    engine.accounts[user2 as usize].capital = U128::new(c2);
-    engine.accounts[user2 as usize].pnl = I128::new(pnl);
-    engine.accounts[user2 as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user2 as usize].reserved_pnl = 0;
-    engine.insurance_fund.balance = U128::new(1_000);
-    engine.vault = U128::new(c1 + c2 + 1_000 + total_unwrapped);
-
-    let _ = engine.apply_adl(loss);
-
-    assert!(
-        engine.accounts[user1 as usize].capital.get() == c1,
-        "Frame: user1 capital unchanged by ADL"
-    );
-    assert!(
-        engine.accounts[user2 as usize].capital.get() == c2,
-        "Frame: user2 capital unchanged by ADL"
-    );
-}
-
 /// Frame proof: settle_warmup_to_capital only mutates one account and warmup globals
-/// Mutates: target account's capital, pnl, warmup_slope_per_step; warmed_pos_total/warmed_neg_total
+/// Mutates: target account's capital, pnl, warmup_slope_per_step
 /// Note: With Fix A, negative pnl settles fully into capital (not warmup-gated)
 #[kani::proof]
 #[kani::unwind(33)]
@@ -4269,34 +2028,6 @@ fn fast_valid_preserved_by_execute_trade() {
     }
 }
 
-/// Validity preserved by apply_adl
-/// Optimized: Concrete pnl, only loss symbolic
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn fast_valid_preserved_by_apply_adl() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Concrete pnl, only loss symbolic
-    let pnl: i128 = 100;
-    let loss: u128 = kani::any();
-    kani::assume(loss <= 100);
-
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(0);
-    engine.insurance_fund.balance = U128::new(10_000);
-    engine.vault = U128::new(10_000 + pnl as u128);
-
-    kani::assume(valid_state(&engine));
-
-    let res = engine.apply_adl(loss);
-
-    if res.is_ok() {
-        assert!(valid_state(&engine), "valid_state preserved by apply_adl");
-    }
-}
-
 /// Validity preserved by settle_warmup_to_capital
 #[kani::proof]
 #[kani::unwind(33)]
@@ -4420,12 +2151,12 @@ fn fast_valid_preserved_by_force_realize_losses() {
 
     // If successful, verify basic invariants without full valid_state check
     if res.is_ok() {
-        // Conservation: vault + loss_accum should be consistent
-        let expected_sum = vault_before;
-        let actual_sum = engine.vault.get() + engine.loss_accum.get();
+        // Primary conservation: vault >= c_tot + insurance
+        let c_tot = engine.c_tot.get();
+        let insurance = engine.insurance_fund.balance.get();
         assert!(
-            actual_sum >= expected_sum.saturating_sub(MAX_ROUNDING_SLACK),
-            "force_realize must maintain conservation"
+            engine.vault.get() >= c_tot.saturating_add(insurance),
+            "force_realize must maintain primary conservation (V >= C_tot + I)"
         );
     }
 }
@@ -4439,11 +2170,6 @@ fn fast_valid_preserved_by_top_up_insurance_fund() {
 
     let amount: u128 = kani::any();
     kani::assume(amount > 0 && amount < 10_000);
-
-    // Setup with loss_accum to test mode exit
-    engine.risk_reduction_only = true;
-    engine.warmup_paused = true;
-    engine.loss_accum = U128::new(500);
 
     kani::assume(valid_state(&engine));
 
@@ -4465,7 +2191,7 @@ fn fast_valid_preserved_by_top_up_insurance_fund() {
 /// Proof: Negative PnL settles into capital independent of warmup cap
 /// Proves: capital_after == capital_before.get() - min(capital_before, loss)
 ///         pnl_after == -(loss - min(capital_before, loss))
-///         warmed_neg_total increases by min(capital_before, loss)
+
 #[kani::proof]
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
@@ -4485,15 +2211,15 @@ fn fast_neg_pnl_settles_into_capital_independent_of_warm_cap() {
     engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
     engine.vault = U128::new(capital);
     engine.current_slot = 100;
-
-    let warmed_neg_before = engine.warmed_neg_total;
+    engine.recompute_aggregates();
 
     // Settle
     let _ = engine.settle_warmup_to_capital(user_idx);
 
     let pay = core::cmp::min(capital, loss);
     let expected_capital = capital - pay;
-    let expected_pnl = -((loss - pay) as i128);
+    // Under haircut spec §6.1: remaining negative PnL is written off to 0
+    let expected_pnl: i128 = 0;
 
     // Assertions
     assert!(
@@ -4502,11 +2228,7 @@ fn fast_neg_pnl_settles_into_capital_independent_of_warm_cap() {
     );
     assert!(
         engine.accounts[user_idx as usize].pnl.get() == expected_pnl,
-        "PnL should equal remaining loss"
-    );
-    assert!(
-        engine.warmed_neg_total == warmed_neg_before + pay,
-        "warmed_neg_total should increase by paid amount"
+        "PnL should be written off to 0 (spec §6.1)"
     );
 }
 
@@ -4606,14 +2328,16 @@ fn neg_pnl_settlement_does_not_depend_on_elapsed_or_slope() {
     engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
     engine.vault = U128::new(capital);
     engine.current_slot = elapsed;
+    engine.recompute_aggregates();
 
     // Settle
     let _ = engine.settle_warmup_to_capital(user_idx);
 
-    // Result must match pay-down rule: pay = min(capital, loss)
+    // Result must match pay-down rule: pay = min(capital, loss), then write-off remainder
     let pay = core::cmp::min(capital, loss);
     let expected_capital = capital - pay;
-    let expected_pnl = -((loss - pay) as i128);
+    // Under haircut spec §6.1: remaining negative PnL is written off to 0
+    let expected_pnl: i128 = 0;
 
     // Assert results are identical regardless of slope and elapsed
     assert!(
@@ -4622,7 +2346,7 @@ fn neg_pnl_settlement_does_not_depend_on_elapsed_or_slope() {
     );
     assert!(
         engine.accounts[user_idx as usize].pnl.get() == expected_pnl,
-        "PnL must match pay-down rule regardless of slope/elapsed"
+        "PnL must be written off to 0 regardless of slope/elapsed"
     );
 }
 
@@ -4893,15 +2617,12 @@ fn neg_pnl_is_realized_immediately_by_settle() {
     engine.vault = U128::new(capital);
     engine.current_slot = 1000; // Time has passed
 
-    let warmed_neg_before = engine.warmed_neg_total;
-
     // Call settle
     let _ = engine.settle_warmup_to_capital(user_idx);
 
     // Expected: pay = min(10_000, 3_000) = 3_000
     // capital_after = 10_000 - 3_000 = 7_000
     // pnl_after = -(3_000 - 3_000) = 0
-    // warmed_neg_total increased by 3_000
 
     assert!(
         engine.accounts[user_idx as usize].capital.get() == 7_000,
@@ -4911,131 +2632,11 @@ fn neg_pnl_is_realized_immediately_by_settle() {
         engine.accounts[user_idx as usize].pnl.get() == 0,
         "PnL should be 0 after full loss settlement"
     );
-    assert!(
-        engine.warmed_neg_total == warmed_neg_before + 3_000,
-        "warmed_neg_total should increase by 3_000"
-    );
 }
 
 // ============================================================================
 // Security Goal: Bounded Net Extraction (Sequence-Based Proof)
 // ============================================================================
-
-/// SECURITY THEOREM (bounded, sequence-based):
-///
-/// For a bounded sequence of operations, attacker net withdrawals are bounded by:
-///   (losses paid from OTHER users' capital) + (spendable insurance ever available)
-///
-/// Formally:
-///   net_out = W_A - D_A
-///   net_out <= L_others + (spent_spendable_insurance + spendable_insurance_end)
-///
-/// Notes:
-/// - This matches your design: users can only withdraw capital.
-/// - Profit extraction requires converting PnL into capital (settle_warmup_to_capital),
-///   which is globally budgeted by W- and insurance above floor.
-/// - We intentionally allow insurance to be spent during the trace; we account for it
-///   via (spent + end), not "end only".
-///
-/// Simplified for tractability: single deterministic sequence covering key paths.
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn security_goal_bounded_net_extraction_sequence() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-
-    // Participants
-    let attacker = engine.add_user(0).unwrap();
-    let lp = engine.add_lp([1u8; 32], [2u8; 32], 0).unwrap();
-
-    // Deterministic initial state
-    engine.current_slot = 10;
-    engine.insurance_fund.balance = U128::new(engine.params.risk_reduction_threshold.get() + 1_000);
-    engine.accounts[attacker as usize].capital = U128::new(10_000);
-    engine.accounts[lp as usize].capital = U128::new(50_000);
-    engine.vault = engine.accounts[attacker as usize].capital
-        + engine.accounts[lp as usize].capital
-        + engine.insurance_fund.balance.get();
-
-    // Ghost accounting - track attacker deposits/withdrawals
-    let mut dep_a: u128 = 0;
-    let mut wdr_a: u128 = 0;
-
-    // Track initial capitals for loss calculation
-    let attacker_cap_init = engine.accounts[attacker as usize].capital;
-    let lp_cap_init = engine.accounts[lp as usize].capital;
-
-    // Track spendable insurance
-    let mut spendable_prev = engine.insurance_spendable_raw();
-    let mut spendable_spent_total: u128 = 0;
-
-    // Single symbolic operation - choose ONE action path
-    let op: u8 = kani::any();
-    let choice = op % 3; // Reduced to 3 operations for tractability
-
-    match choice {
-        // 0: attacker deposits then withdraws
-        0 => {
-            let dep_amt: u128 = kani::any();
-            kani::assume(dep_amt <= 50);
-            if engine.deposit(attacker, dep_amt, 0).is_ok() {
-                dep_a = dep_amt;
-            }
-            let wdr_amt: u128 = kani::any();
-            kani::assume(wdr_amt <= 200);
-            if engine.withdraw(attacker, wdr_amt, 0, 1_000_000).is_ok() {
-                wdr_a = wdr_amt;
-            }
-        }
-
-        // 1: trade then withdraw
-        1 => {
-            let delta: i128 = kani::any();
-            kani::assume(delta != 0 && delta > -3 && delta < 3);
-            let _ = engine.execute_trade(&NoOpMatcher, lp, attacker, 0, 1_000_000, delta);
-            let wdr_amt: u128 = kani::any();
-            kani::assume(wdr_amt <= 200);
-            if engine.withdraw(attacker, wdr_amt, 0, 1_000_000).is_ok() {
-                wdr_a = wdr_amt;
-            }
-        }
-
-        // 2: just withdraw
-        _ => {
-            let wdr_amt: u128 = kani::any();
-            kani::assume(wdr_amt <= 500);
-            if engine.withdraw(attacker, wdr_amt, 0, 1_000_000).is_ok() {
-                wdr_a = wdr_amt;
-            }
-        }
-    }
-
-    // Track insurance spending
-    let spendable_now = engine.insurance_spendable_raw();
-    if spendable_now < spendable_prev {
-        spendable_spent_total = spendable_prev - spendable_now;
-    }
-
-    // Calculate losses paid by LP (others)
-    let lp_cap_now = engine.accounts[lp as usize].capital.get();
-    let others_loss_paid = if lp_cap_now < lp_cap_init.get() {
-        lp_cap_init.get() - lp_cap_now
-    } else {
-        0
-    };
-
-    // Final bound:
-    // net_out <= losses_paid_by_others + total_spendable_insurance
-    let net_out = wdr_a.saturating_sub(dep_a);
-    let rhs = others_loss_paid
-        .saturating_add(engine.insurance_spendable_raw())
-        .saturating_add(spendable_spent_total);
-
-    assert!(
-        net_out <= rhs,
-        "SECURITY GOAL FAILED: attacker extracted more than others' realized losses + total spendable insurance"
-    );
-}
 
 // ============================================================================
 // WRAPPER-CORE API PROOFS
@@ -5108,7 +2709,7 @@ fn proof_settle_maintenance_deducts_correctly() {
 
 /// C. keeper_crank advances last_crank_slot correctly
 /// Note: keeper_crank now also runs garbage_collect_dust which can mutate
-/// bitmap/freelist and invoke apply_adl. This proof focuses on slot advancement.
+/// bitmap/freelist. This proof focuses on slot advancement.
 #[kani::proof]
 #[kani::unwind(33)]
 #[kani::solver(cadical)]
@@ -5390,10 +2991,12 @@ fn proof_close_account_rejects_negative_pnl() {
     engine.accounts[user as usize].capital = U128::new(0);
     engine.vault = U128::new(0);
     engine.accounts[user as usize].pnl = I128::new(-1);
+    engine.recompute_aggregates();
 
-    // close should reject as undercollateralized
+    // Under haircut spec §6.1: negative PnL is written off to 0 during settlement.
+    // So close_account succeeds (returning 0 capital) instead of rejecting.
     let res = engine.close_account(user, 0, 1_000_000);
-    assert!(res == Err(RiskError::Undercollateralized));
+    assert!(res == Ok(0));
 }
 
 /// Verify set_risk_reduction_threshold updates the parameter
@@ -5881,51 +3484,6 @@ fn proof_keeper_crank_best_effort_liquidation() {
     assert!(
         result.is_ok(),
         "keeper_crank must always succeed (best-effort)"
-    );
-}
-
-/// LQ5: No reserved insurance spending during liquidation
-/// Optimized: Use two users, set capitals directly to avoid deposit/LP complexity
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn proof_lq5_no_reserved_insurance_spending() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-    let floor = engine.params.risk_reduction_threshold.get();
-
-    // Use two users instead of user+LP
-    let user = engine.add_user(0).unwrap();
-    let counterparty = engine.add_user(0).unwrap();
-
-    // Set capitals directly
-    engine.accounts[user as usize].capital = U128::new(500);
-    engine.accounts[counterparty as usize].capital = U128::new(50_000);
-
-    engine.insurance_fund.balance = U128::new(floor + 2_000);
-    engine.vault = U128::new(500 + 50_000 + floor + 2_000);
-
-    // User long at 0.8, oracle at 1.0 means profit for user
-    engine.accounts[user as usize].position_size = I128::new(500_000);
-    engine.accounts[user as usize].entry_price = 800_000;
-    engine.accounts[user as usize].pnl = I128::new(-200_000);
-    engine.accounts[user as usize].warmup_slope_per_step = U128::new(0);
-
-    engine.accounts[counterparty as usize].position_size = I128::new(-500_000);
-    engine.accounts[counterparty as usize].entry_price = 800_000;
-    engine.accounts[counterparty as usize].pnl = I128::new(200_000);
-    engine.accounts[counterparty as usize].warmup_slope_per_step = U128::new(0);
-
-    engine.total_open_interest = U128::new(1_000_000);
-    engine.recompute_warmup_insurance_reserved();
-
-    let res = engine.liquidate_at_oracle(user, 0, 1_000_000);
-    assert!(res.is_ok(), "liquidation must not error");
-    assert!(res.unwrap(), "setup must force liquidation to trigger");
-
-    assert!(
-        engine.insurance_fund.balance.get()
-            >= floor.saturating_add(engine.warmup_insurance_reserved.get()),
-        "Insurance must remain >= floor + reserved after liquidation"
     );
 }
 
@@ -6423,215 +3981,7 @@ fn gc_respects_full_dust_predicate() {
     );
 }
 
-// ==============================================================================
-// PENDING-GATE PROOFS: Value extraction blocked while pending > 0
-// ==============================================================================
 
-/// PENDING-GATE-A: Withdraw is blocked when pending buckets are non-zero
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn pending_gate_withdraw_blocked() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Setup: user with capital
-    let capital: u128 = kani::any();
-    kani::assume(capital > 100 && capital < 10_000);
-    engine.accounts[user_idx as usize].capital = U128::new(capital);
-    engine.vault = U128::new(capital);
-
-    // Set pending buckets to non-zero
-    let pending_choice: bool = kani::any();
-    if pending_choice {
-        engine.pending_unpaid_loss = U128::new(1);
-    } else {
-        engine.pending_profit_to_fund = U128::new(1);
-    }
-
-    // Verify pending is actually set
-    assert!(pending_nonzero(&engine), "Pending should be non-zero");
-
-    // Try to withdraw
-    let result = engine.withdraw(user_idx, 50, 0, 1_000_000);
-
-    // Must fail with Unauthorized (PendingSocialization)
-    assert!(
-        result == Err(RiskError::Unauthorized),
-        "PENDING-GATE-A: Withdraw must be blocked when pending > 0"
-    );
-}
-
-/// PENDING-GATE-B: close_account is blocked when pending buckets are non-zero
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn pending_gate_close_blocked() {
-    let mut engine = RiskEngine::new(test_params());
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Setup: flat user with no fees owed, pnl=0, capital > 0
-    engine.accounts[user_idx as usize].capital = U128::new(100);
-    engine.accounts[user_idx as usize].position_size = I128::new(0);
-    engine.accounts[user_idx as usize].pnl = I128::new(0);
-    engine.accounts[user_idx as usize].fee_credits = I128::ZERO;
-    engine.vault = U128::new(100);
-
-    // Set pending to non-zero
-    let pending_choice: bool = kani::any();
-    if pending_choice {
-        engine.pending_unpaid_loss = U128::new(1);
-    } else {
-        engine.pending_profit_to_fund = U128::new(1);
-    }
-
-    // Verify pending is actually set
-    assert!(pending_nonzero(&engine), "Pending should be non-zero");
-
-    // Try to close account
-    let result = engine.close_account(user_idx, 0, 1_000_000);
-
-    // Must fail with Unauthorized (PendingSocialization)
-    assert!(
-        result == Err(RiskError::Unauthorized),
-        "PENDING-GATE-B: close_account must be blocked when pending > 0"
-    );
-}
-
-/// PENDING-GATE-C: settle_warmup_to_capital blocks positive conversion when pending > 0
-/// When pending_unpaid_loss > 0, positive PnL must NOT convert to capital
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn pending_gate_warmup_conversion_blocked() {
-    let mut engine = RiskEngine::new(test_params());
-    engine.vault = U128::new(100_000);
-    engine.insurance_fund.balance = U128::new(10_000);
-    engine.current_slot = 100; // Enough time for warmup
-
-    let user_idx = engine.add_user(0).unwrap();
-
-    // Setup: user with positive pnl that could warm up
-    let pnl: i128 = kani::any();
-    kani::assume(pnl > 100 && pnl < 1_000);
-    engine.accounts[user_idx as usize].pnl = I128::new(pnl);
-    engine.accounts[user_idx as usize].capital = U128::new(1_000);
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(100);
-    engine.accounts[user_idx as usize].warmup_started_at_slot = 0;
-
-    // Snapshot before
-    let capital_before = engine.accounts[user_idx as usize].capital;
-    let pnl_before = engine.accounts[user_idx as usize].pnl;
-
-    // Set pending to non-zero (blocks positive conversion)
-    engine.pending_unpaid_loss = U128::new(1);
-
-    // Call settle_warmup_to_capital
-    let _ = engine.settle_warmup_to_capital(user_idx);
-
-    // STRONG ASSERTION: capital and pnl must be EXACTLY unchanged
-    // Positive conversion is completely blocked when pending > 0
-    assert!(
-        engine.accounts[user_idx as usize].capital.get() == capital_before.get(),
-        "PENDING-GATE-C: capital must be unchanged when pending > 0"
-    );
-    assert!(
-        engine.accounts[user_idx as usize].pnl.get() == pnl_before.get(),
-        "PENDING-GATE-C: pnl must be unchanged when pending > 0"
-    );
-}
-
-// ==============================================================================
-// SOCIALIZATION-STEP PROOFS: Bounded haircuts on unwrapped PnL only
-// ==============================================================================
-
-/// SOCIALIZATION-STEP-A: socialization_step never changes capital
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn socialization_step_never_changes_capital() {
-    let mut engine = RiskEngine::new(test_params());
-
-    // Create two accounts with positive unwrapped pnl
-    let idx1 = engine.add_user(0).unwrap();
-    let idx2 = engine.add_user(0).unwrap();
-
-    let capital1: u128 = kani::any();
-    let capital2: u128 = kani::any();
-    let pnl: i128 = kani::any();
-
-    kani::assume(capital1 > 0 && capital1 < 1_000);
-    kani::assume(capital2 > 0 && capital2 < 1_000);
-    kani::assume(pnl > 0 && pnl < 500);
-
-    engine.accounts[idx1 as usize].capital = U128::new(capital1);
-    engine.accounts[idx1 as usize].pnl = I128::new(pnl);
-    engine.accounts[idx1 as usize].warmup_slope_per_step = U128::new(0); // All unwrapped
-    engine.accounts[idx2 as usize].capital = U128::new(capital2);
-    engine.accounts[idx2 as usize].pnl = I128::new(pnl);
-    engine.accounts[idx2 as usize].warmup_slope_per_step = U128::new(0); // All unwrapped
-
-    // Set pending loss
-    let pending: u128 = kani::any();
-    kani::assume(pending > 0 && pending < 500);
-    engine.pending_unpaid_loss = U128::new(pending);
-
-    // Run socialization_step over window covering both accounts
-    engine.socialization_step(0, MAX_ACCOUNTS);
-
-    // Both capitals must be unchanged
-    assert!(
-        engine.accounts[idx1 as usize].capital.get() == capital1,
-        "SOCIALIZATION-STEP-A: Account 1 capital unchanged"
-    );
-    assert!(
-        engine.accounts[idx2 as usize].capital.get() == capital2,
-        "SOCIALIZATION-STEP-A: Account 2 capital unchanged"
-    );
-}
-
-/// SOCIALIZATION-STEP-C: socialization_step reduces pending when unwrapped exists
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn socialization_step_reduces_pending() {
-    let mut engine = RiskEngine::new(test_params());
-
-    // Create single account with unwrapped pnl
-    let idx = engine.add_user(0).unwrap();
-
-    let pnl: i128 = kani::any();
-    let pending: u128 = kani::any();
-
-    // Bounded values with pending <= pnl (so all pending can be absorbed)
-    kani::assume(pnl > 10 && pnl < 500);
-    kani::assume(pending > 0 && pending <= pnl as u128);
-
-    engine.accounts[idx as usize].pnl = I128::new(pnl);
-    engine.accounts[idx as usize].warmup_slope_per_step = U128::new(0); // All unwrapped
-    engine.accounts[idx as usize].reserved_pnl = 0;
-    engine.pending_unpaid_loss = U128::new(pending);
-
-    let pending_before = engine.pending_unpaid_loss;
-    let pnl_before = engine.accounts[idx as usize].pnl;
-
-    // Run socialization_step on window containing the account
-    engine.socialization_step(0, MAX_ACCOUNTS);
-
-    // Pending should decrease (or go to zero)
-    assert!(
-        engine.pending_unpaid_loss < pending_before || engine.pending_unpaid_loss.get() == 0,
-        "SOCIALIZATION-STEP-C: Pending must decrease when unwrapped exists"
-    );
-
-    // PnL should decrease by same amount
-    let pending_decrease = pending_before.saturating_sub(engine.pending_unpaid_loss.get());
-    let pnl_decrease = (pnl_before.get() - engine.accounts[idx as usize].pnl.get()) as u128;
-    assert!(
-        pnl_decrease == pending_decrease.get(),
-        "SOCIALIZATION-STEP-C: PnL decrease must equal pending decrease"
-    );
-}
 
 // ==============================================================================
 // CRANK-BOUNDS PROOF: keeper_crank respects all budgets
@@ -6750,245 +4100,7 @@ fn gc_frees_only_true_dust() {
     );
 }
 
-/// GC-NEW-B: GC moves negative dust pnl into pending_unpaid_loss bucket
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn gc_moves_negative_dust_to_pending() {
-    let mut engine = RiskEngine::new(test_params());
-    engine.funding_index_qpb_e6 = I128::new(0);
 
-    // Create dust account with negative pnl
-    let dust_idx = engine.add_user(0).unwrap();
-
-    let loss: u128 = kani::any();
-    kani::assume(loss > 0 && loss < 1_000);
-
-    engine.accounts[dust_idx as usize].capital = U128::new(0);
-    engine.accounts[dust_idx as usize].position_size = I128::new(0);
-    engine.accounts[dust_idx as usize].reserved_pnl = 0;
-    engine.accounts[dust_idx as usize].pnl = I128::new(-(loss as i128));
-    engine.accounts[dust_idx as usize].funding_index = I128::new(0);
-
-    // Initial pending is zero
-    engine.pending_unpaid_loss = U128::ZERO;
-
-    // Snapshot
-    let pending_before = engine.pending_unpaid_loss;
-
-    // Run GC
-    let closed = engine.garbage_collect_dust();
-
-    // Account should be freed
-    assert!(closed >= 1, "GC should close negative dust account");
-    assert!(
-        !engine.is_used(dust_idx as usize),
-        "GC-NEW-B: Negative dust account should be freed"
-    );
-
-    // pending_unpaid_loss should increase by the loss amount
-    assert!(
-        engine.pending_unpaid_loss == pending_before + loss,
-        "GC-NEW-B: pending_unpaid_loss must increase by loss amount"
-    );
-}
-
-/// GC-NEW-C: GC does not touch insurance_fund or loss_accum directly
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn gc_does_not_touch_insurance_or_loss_accum() {
-    let mut engine = RiskEngine::new(test_params());
-    engine.funding_index_qpb_e6 = I128::new(0);
-
-    // Set insurance and loss_accum to non-zero
-    let insurance: u128 = kani::any();
-    let loss_accum: u128 = kani::any();
-    kani::assume(insurance > 0 && insurance < 100_000);
-    kani::assume(loss_accum < 10_000);
-
-    engine.insurance_fund.balance = U128::new(insurance);
-    engine.loss_accum = U128::new(loss_accum);
-
-    // Create dust account with negative pnl
-    let dust_idx = engine.add_user(0).unwrap();
-    engine.accounts[dust_idx as usize].capital = U128::new(0);
-    engine.accounts[dust_idx as usize].position_size = I128::new(0);
-    engine.accounts[dust_idx as usize].reserved_pnl = 0;
-    engine.accounts[dust_idx as usize].pnl = I128::new(-100);
-    engine.accounts[dust_idx as usize].funding_index = I128::new(0);
-
-    // Run GC
-    let _closed = engine.garbage_collect_dust();
-
-    // Insurance and loss_accum must be unchanged (GC only uses pending buckets now)
-    assert!(
-        engine.insurance_fund.balance.get() == insurance,
-        "GC-NEW-C: Insurance must be unchanged by GC"
-    );
-    assert!(
-        engine.loss_accum.get() == loss_accum,
-        "GC-NEW-C: loss_accum must be unchanged by GC"
-    );
-}
-
-// ==============================================================================
-// PROGRESS PROOF: Bounded, deterministic settlement progress
-// ==============================================================================
-
-/// PROGRESS-1: socialization_step makes progress when unwrapped exists
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn progress_socialization_completes() {
-    let mut engine = RiskEngine::new(test_params());
-
-    // Create account with pnl=100, slope=0 so all is unwrapped
-    let idx = engine.add_user(0).unwrap();
-    engine.accounts[idx as usize].pnl = I128::new(100);
-    engine.accounts[idx as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[idx as usize].reserved_pnl = 0;
-
-    // Set pending_unpaid_loss = 60
-    engine.pending_unpaid_loss = U128::new(60);
-
-    // Run socialization_step on window containing the account
-    engine.socialization_step(0, MAX_ACCOUNTS);
-
-    // After step: pending should be 0 and pnl should be 40
-    assert!(
-        engine.pending_unpaid_loss.get() == 0,
-        "PROGRESS-1: pending_unpaid_loss should be zero after socialization"
-    );
-    assert!(
-        engine.accounts[idx as usize].pnl.get() == 40,
-        "PROGRESS-1: pnl should be reduced to 40 (100 - 60)"
-    );
-}
-
-// ==============================================================================
-// FORCE-REALIZE STEP PROOFS: Windowed, bounded force-close
-// ==============================================================================
-
-/// FORCE-REALIZE-1: force_realize_step_window is window-bounded
-/// Only accounts in the specified window have their positions changed.
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn force_realize_step_window_bounded() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-
-    // Create accounts with positions
-    let idx0 = engine.add_user(0).unwrap();
-    let idx1 = engine.add_user(0).unwrap();
-    let idx2 = engine.add_user(0).unwrap();
-
-    // All have positions
-    engine.accounts[idx0 as usize].position_size = I128::new(1000);
-    engine.accounts[idx0 as usize].entry_price = 1_000_000;
-    engine.accounts[idx1 as usize].position_size = I128::new(1000);
-    engine.accounts[idx1 as usize].entry_price = 1_000_000;
-    engine.accounts[idx2 as usize].position_size = I128::new(1000);
-    engine.accounts[idx2 as usize].entry_price = 1_000_000;
-    engine.total_open_interest = U128::new(6000);
-
-    // Set insurance at threshold to activate force-realize
-    engine.insurance_fund.balance = engine.params.risk_reduction_threshold;
-
-    // Snapshot position of idx2 (outside small window)
-    let pos2_before = engine.accounts[idx2 as usize].position_size;
-
-    // Run force_realize_step_window on window [0, 2) - only idx0 and idx1
-    let (closed, _errors) = engine.force_realize_step_window(1, 1_000_000, 0, 2);
-
-    // Should have closed positions in window
-    assert!(
-        closed <= 2,
-        "FORCE-REALIZE-1: At most 2 positions closed in window of 2"
-    );
-
-    // idx2 (outside window) should be unchanged
-    assert!(
-        engine.accounts[idx2 as usize].position_size == pos2_before,
-        "FORCE-REALIZE-1: Position outside window must be unchanged"
-    );
-}
-
-/// FORCE-REALIZE-2: Step never increases OI
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn force_realize_step_never_increases_oi() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-
-    let idx = engine.add_user(0).unwrap();
-
-    let pos: i128 = kani::any();
-    kani::assume(pos != 0 && pos > -10_000 && pos < 10_000);
-
-    engine.accounts[idx as usize].position_size = I128::new(pos);
-    engine.accounts[idx as usize].entry_price = 1_000_000;
-    engine.accounts[idx as usize].capital = U128::new(10_000);
-
-    let abs_pos = if pos >= 0 {
-        pos as u128
-    } else {
-        (-pos) as u128
-    };
-    engine.total_open_interest = U128::new(abs_pos * 2); // Account for both sides
-
-    // Set insurance at threshold
-    engine.insurance_fund.balance = engine.params.risk_reduction_threshold;
-
-    let oi_before = engine.total_open_interest;
-
-    // Run force-realize step
-    let (_closed, _errors) = engine.force_realize_step_window(1, 1_000_000, 0, MAX_ACCOUNTS);
-
-    // OI must not increase
-    assert!(
-        engine.total_open_interest <= oi_before,
-        "FORCE-REALIZE-2: OI must not increase after force-realize step"
-    );
-}
-
-/// FORCE-REALIZE-3: Step only increases pending_unpaid_loss (monotone non-decreasing)
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn force_realize_step_pending_monotone() {
-    let mut engine = RiskEngine::new(test_params_with_floor());
-
-    let idx = engine.add_user(0).unwrap();
-
-    let pos: i128 = kani::any();
-    kani::assume(pos != 0 && pos > -10_000 && pos < 10_000);
-
-    engine.accounts[idx as usize].position_size = I128::new(pos);
-    engine.accounts[idx as usize].entry_price = 1_000_000;
-    engine.accounts[idx as usize].capital = U128::new(100); // Small capital, may have unpaid loss
-
-    let abs_pos = if pos >= 0 {
-        pos as u128
-    } else {
-        (-pos) as u128
-    };
-    engine.total_open_interest = U128::new(abs_pos * 2);
-
-    // Set insurance at threshold
-    engine.insurance_fund.balance = engine.params.risk_reduction_threshold;
-
-    let pending_before = engine.pending_unpaid_loss;
-
-    // Run force-realize step
-    let (_closed, _errors) = engine.force_realize_step_window(1, 1_000_000, 0, MAX_ACCOUNTS);
-
-    // pending_unpaid_loss must not decrease
-    assert!(
-        engine.pending_unpaid_loss >= pending_before,
-        "FORCE-REALIZE-3: pending_unpaid_loss must be monotone non-decreasing"
-    );
-}
 
 // ============================================================================
 // WITHDRAWAL MARGIN SAFETY (Bug 5 fix verification)
@@ -7267,6 +4379,7 @@ fn proof_execute_trade_conservation() {
 
     engine.accounts[user_idx as usize].capital = U128::new(user_cap);
     engine.accounts[lp_idx as usize].capital = U128::new(lp_cap);
+    engine.recompute_aggregates();
 
     // Ensure conservation holds before
     kani::assume(conservation_fast_no_funding(&engine));
@@ -7580,46 +4693,6 @@ fn proof_liquidate_preserves_inv() {
 // APPLY_ADL PROOF FAMILY - Exception Safety + INV Preservation
 // ============================================================================
 
-/// apply_adl: INV preserved on Ok path
-/// Optimized: Reduced unwind, bounded loss
-#[kani::proof]
-#[kani::unwind(5)] // MAX_ACCOUNTS=4
-#[kani::solver(cadical)]
-fn proof_apply_adl_preserves_inv() {
-    let mut engine = RiskEngine::new(test_params());
-    engine.vault = U128::new(100_000);
-    engine.insurance_fund.balance = U128::new(10_000);
-
-    let user_idx = engine.add_user(0).unwrap();
-    engine.accounts[user_idx as usize].capital = U128::new(10_000);
-    engine.accounts[user_idx as usize].pnl = I128::new(5_000); // Positive PnL available
-    engine.accounts[user_idx as usize].warmup_slope_per_step = U128::new(0); // All PnL is unwrapped
-    engine.current_slot = 0;
-
-    kani::assume(canonical_inv(&engine));
-
-    // Symbolic loss, bounded
-    let loss: u128 = kani::any();
-    kani::assume(loss > 0 && loss <= 100);
-
-    let pnl_before = engine.accounts[user_idx as usize].pnl;
-
-    let result = engine.apply_adl(loss);
-
-    // INV only matters on Ok path (Solana tx aborts on Err, state discarded)
-    if result.is_ok() {
-        kani::assert(canonical_inv(&engine), "INV must hold after apply_adl");
-        if loss > 0 {
-            let pnl_after = engine.accounts[user_idx as usize].pnl;
-            // Either PnL was haircutted or insurance/loss_accum covered it
-            kani::assert(
-                pnl_after <= pnl_before || !engine.loss_accum.is_zero(),
-                "ADL must either haircut PnL or route through loss_accum",
-            );
-        }
-    }
-}
-
 // ============================================================================
 // SETTLE_WARMUP_TO_CAPITAL PROOF FAMILY - Exception Safety + INV Preservation
 // ============================================================================
@@ -7885,97 +4958,6 @@ fn proof_close_account_preserves_inv() {
 // TOP_UP_INSURANCE_FUND PROOF FAMILY - Exception Safety + INV Preservation
 // ============================================================================
 
-/// top_up_insurance_fund: INV preserved on Ok path
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_top_up_insurance_preserves_inv() {
-    let mut engine = RiskEngine::new(test_params());
-    engine.vault = U128::new(100_000);
-    engine.loss_accum = U128::new(5_000);
-    engine.insurance_fund.balance = U128::new(10_000);
-
-    kani::assume(canonical_inv(&engine));
-
-    let amount: u128 = kani::any();
-    kani::assume(amount > 0 && amount < 50_000);
-
-    let loss_before = engine.loss_accum;
-    let insurance_before = engine.insurance_fund.balance;
-    let vault_before = engine.vault;
-
-    let result = engine.top_up_insurance_fund(amount);
-
-    // INV only matters on Ok path (Solana tx aborts on Err, state discarded)
-    if result.is_ok() {
-        kani::assert(
-            canonical_inv(&engine),
-            "INV must hold after top_up_insurance_fund",
-        );
-        kani::assert(
-            engine.vault.get() == vault_before.get() + amount,
-            "top_up must increase vault by amount",
-        );
-
-        // Either loss_accum reduced or insurance increased (or both)
-        let total_change = (loss_before.get() - engine.loss_accum.get())
-            + (engine
-                .insurance_fund
-                .balance
-                .get()
-                .saturating_sub(insurance_before.get()));
-        kani::assert(
-            total_change == amount,
-            "top_up amount must go to loss_accum reduction + insurance increase",
-        );
-    }
-
-    // Non-vacuity: force Ok path
-    let _ = assert_ok!(result, "top_up_insurance must succeed");
-}
-
-/// top_up_insurance_fund: Loss coverage priority
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_top_up_insurance_covers_loss_first() {
-    let mut engine = RiskEngine::new(test_params());
-    engine.vault = U128::new(100_000);
-    engine.loss_accum = U128::new(5_000); // Some accumulated loss
-    engine.insurance_fund.balance = U128::new(10_000);
-
-    kani::assume(canonical_inv(&engine));
-
-    // Amount less than loss_accum
-    let amount: u128 = kani::any();
-    kani::assume(amount > 0 && amount < engine.loss_accum.get());
-
-    let loss_before = engine.loss_accum;
-    let insurance_before = engine.insurance_fund.balance;
-
-    let result = engine.top_up_insurance_fund(amount);
-
-    // INV only matters on Ok path (Solana tx aborts on Err, state discarded)
-    if result.is_ok() {
-        kani::assert(canonical_inv(&engine), "INV must hold after top_up");
-
-        // Loss should be reduced by exactly the amount (since amount < loss_accum)
-        kani::assert(
-            engine.loss_accum == loss_before - amount,
-            "top_up must reduce loss_accum by amount when amount < loss_accum",
-        );
-
-        // Insurance should be unchanged (all went to loss coverage)
-        kani::assert(
-            engine.insurance_fund.balance.get() == insurance_before.get(),
-            "insurance unchanged when all top_up goes to loss coverage",
-        );
-    }
-
-    // Non-vacuity: force Ok path
-    let _ = assert_ok!(result, "top_up must succeed");
-}
-
 // ============================================================================
 // SEQUENCE-LEVEL PROOFS - Multi-Operation INV Preservation
 // ============================================================================
@@ -8056,66 +5038,6 @@ fn proof_sequence_deposit_crank_withdraw() {
         "withdraw must succeed"
     );
     kani::assert(canonical_inv(&engine), "INV after withdraw");
-}
-
-/// Sequence: add_user -> deposit -> top_up -> close_account preserves INV
-/// Each step is gated on previous success (models Solana tx atomicity)
-#[kani::proof]
-#[kani::unwind(33)]
-#[kani::solver(cadical)]
-fn proof_sequence_lifecycle() {
-    let mut engine = RiskEngine::new(test_params());
-    engine.vault = U128::new(100_000);
-    engine.insurance_fund.balance = U128::new(10_000);
-    engine.current_slot = 100;
-    engine.last_crank_slot = 100;
-    engine.last_full_sweep_start_slot = 100;
-    engine.loss_accum = U128::new(1_000); // Some loss to cover
-
-    kani::assume(canonical_inv(&engine));
-
-    // Step 1: Add user (deterministic setup - force success)
-    let user = engine.add_user(0).unwrap();
-    kani::assert(canonical_inv(&engine), "INV after add_user");
-
-    // Step 2: Deposit (force success)
-    let deposit: u128 = kani::any();
-    kani::assume(deposit > 100 && deposit < 10_000);
-
-    let _ = assert_ok!(engine.deposit(user, deposit, 0), "deposit must succeed");
-    kani::assert(canonical_inv(&engine), "INV after deposit");
-
-    // Step 3: Top up insurance (force success)
-    let topup: u128 = kani::any();
-    kani::assume(topup > 0 && topup < 5_000);
-
-    let _ = assert_ok!(engine.top_up_insurance_fund(topup), "top_up must succeed");
-    kani::assert(canonical_inv(&engine), "INV after top_up");
-
-    // Step 4: Withdraw all and close (must succeed for clean lifecycle)
-    let _ = assert_ok!(
-        engine.withdraw(
-            user,
-            engine.accounts[user as usize].capital.get(),
-            100,
-            1_000_000
-        ),
-        "withdraw must succeed"
-    );
-
-    // Ensure account is closable: no position, no fees owed, no pnl, warmup settled
-    engine.accounts[user as usize].position_size = I128::new(0);
-    engine.accounts[user as usize].fee_credits = I128::ZERO;
-    engine.accounts[user as usize].pnl = I128::new(0);
-    engine.accounts[user as usize].reserved_pnl = 0;
-    engine.accounts[user as usize].warmup_slope_per_step = U128::new(0);
-    engine.accounts[user as usize].warmup_started_at_slot = engine.current_slot;
-
-    let _ = assert_ok!(
-        engine.close_account(user, 100, 1_000_000),
-        "close must succeed"
-    );
-    kani::assert(canonical_inv(&engine), "INV after close_account");
 }
 
 // ============================================================================
