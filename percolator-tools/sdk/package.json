@@ -1,0 +1,35 @@
+{
+  "name": "@percolatortool/sdk",
+  "version": "0.1.3",
+  "description": "TypeScript SDK for Percolator — types and instruction builders (deposit, withdraw, trade, keeper crank) for wrapper programs and frontends on Solana. Built for the Percolator audit and ecosystem tooling.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cryptoduke01/percolator.git",
+    "directory": "percolator-tools/sdk"
+  },
+  "homepage": "https://github.com/cryptoduke01/percolator/tree/master/percolator-tools/sdk#readme",
+  "keywords": [
+    "percolator",
+    "solana",
+    "perpetual",
+    "dex",
+    "risk-engine",
+    "wrapper",
+    "keeper"
+  ],
+  "author": "https://x.com/YOUR_X_HANDLE",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "@solana/web3.js": "^1.87.0"
+  }
+}

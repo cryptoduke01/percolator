@@ -39,3 +39,12 @@ desktop.ini
 .env
 .env.local
 test-ledger/
+
+# Node / JS (percolator-tools)
+node_modules/
+**/node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+.pnpm-store/
